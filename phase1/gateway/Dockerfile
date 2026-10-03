@@ -1,7 +1,6 @@
 FROM node:22-slim
 
-# Docker CLI so the gateway can spawn sibling session containers through
-# the mounted /var/run/docker.sock.
+# Docker CLI to drive per-conversation exec containers through the socket.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl gnupg \
  && install -m 0755 -d /etc/apt/keyrings \
@@ -13,6 +12,8 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
+COPY package.json ./
+RUN npm install --no-audit --no-fund
 COPY gateway.js ./
 COPY lib/ ./lib/
 

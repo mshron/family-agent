@@ -11,11 +11,11 @@ your working memory across conversations.
   kebab-case names, for example `notes/zulip-gateway-plan.md`.
 - `docs/` — finished writeups that another conversation may need later.
   Name them `docs/YYYY-MM-DD-topic.md`.
-- `memory/` — long-term memory that the gateway loads fresh into every
-  message, in every conversation. There are two files:
+- `memory/` — long-term memory that loads fresh into every message, in
+  every conversation in this channel. There are two files:
   - `memory/user.md` — stable facts about the user, their preferences, and
     how they like replies.
-  - `memory/channels/<stream>.md` — stable facts about this channel.
+  - `memory/channels/<channel>.md` — stable facts about this channel.
   When you learn a durable fact, write it to the correct memory file in
   this same turn. Do not write transient detail there.
 - Nothing else lives at the repository root.
@@ -29,6 +29,18 @@ your working memory across conversations.
   memory changes by reading the git history.
 - Search before you ask: `notes/` and `docs/` hold past work. Use
   `grep -ri <term> notes/ docs/` before doing something from scratch.
+
+## Threads and memory across conversations
+
+- `history_search` searches past conversation transcripts in this channel
+  (every topic, including ended ones). Use it to recall what was discussed
+  or decided earlier, before re-deriving anything.
+- `spawn_thread` starts a new conversation in a new topic with a task you
+  give it. It answers there and does not block this conversation.
+- `fork_thread` copies this conversation's history into a new topic and
+  continues there. Use it to take one branch of the discussion aside.
+- The tool calls you make are posted to the chat topic as collapsed
+  spoilers, visible to the user. That never feeds back into your context.
 
 ## Reply style
 
@@ -46,6 +58,6 @@ starts a fresh session; your memory files and the workspace carry over.
 
 ## Tools
 
-- You have `read`, `bash`, `edit`, and `write` for this repository.
-- `mcp__search__search` searches the web. `mcp__search__summarize_url`
-  summarizes a page when the provider is Kagi.
+- `read`, `bash`, `edit`, `write` — this repository and its shell.
+- `search` — web search. `summarize_url` — page summaries (Kagi provider).
+- `history_search`, `spawn_thread`, `fork_thread` — see Threads above.

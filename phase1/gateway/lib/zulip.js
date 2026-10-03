@@ -1,5 +1,4 @@
-// Zulip REST client: long-poll one event queue, send stream messages.
-// No dependencies; Node 22 global fetch, basic auth.
+// Zulip REST client: long-poll one event queue, send and edit stream messages.
 
 export class Zulip {
   constructor({ site, email, apiKey, fetchImpl = fetch }) {
@@ -16,7 +15,7 @@ export class Zulip {
     let opts = { method, headers: { Authorization: this.auth } };
     if (method === "GET") {
       for (const [k, v] of Object.entries(params || {})) {
-        url.searchParams.set(k, String(v));
+        url.searchParams.set(k, typeof v === "string" ? v : JSON.stringify(v));
       }
     } else {
       const body = new URLSearchParams();
@@ -41,14 +40,12 @@ export class Zulip {
     return this._call("GET", "users/me");
   }
 
-  /** Create the stream if absent and subscribe this bot to it. */
   subscribeSelf(streamName, description) {
     return this._call("POST", "users/me/subscriptions", {
       subscriptions: [{ name: streamName, description: description || "" }],
     });
   }
 
-  /** Add other users (by email) to a stream; resolves to {added, msg}. */
   async subscribeOthers(streamName, emails) {
     if (!emails || emails.length === 0) return { added: [] };
     try {
@@ -62,7 +59,6 @@ export class Zulip {
     }
   }
 
-  /** Register an event queue narrowed to one stream. Long-lived. */
   register(streamName) {
     return this._call("POST", "register", {
       event_types: ["message"],
@@ -71,10 +67,6 @@ export class Zulip {
     });
   }
 
-  /**
-   * Long-poll for events. Resolves with an events array; rejects on
-   * queue expiry (re-register) or transport errors.
-   */
   async getEvents(queueId, lastEventId) {
     const body = await this._call("GET", "events", {
       queue_id: queueId,
@@ -96,6 +88,39 @@ export class Zulip {
       to: JSON.stringify([stream]),
       subject: topic,
       content,
+    });
+  }
+
+  /** One message by id (fresh subject/content, e.g. after a topic rename). */
+  getMessage(messageId) {
+    return this._call("GET", `messages/${messageId}`);
+  }
+
+  /** Messages in one topic, oldest-last. */
+  async getTopicMessages(stream, topic, numBefore = 100) {
+    const body = await this._call("GET", "messages", {
+      anchor: "newest",
+      num_before: numBefore,
+      num_after: 0,
+      narrow: [
+        { operator: "channel", operand: stream },
+        { operator: "topic", operand: topic },
+      ],
+    });
+    return body.messages || [];
+  }
+
+  /**
+   * Move messageId and everything after it in its thread to a new topic.
+   * `change_later` keeps earlier bursts in place (general chat accumulates
+   * unrelated messages; change_all would mislabel them).
+   */
+  renameTopic(messageId, newTopic) {
+    return this._call("PATCH", `messages/${messageId}`, {
+      topic: newTopic,
+      propagate_mode: "change_later",
+      send_notification_to_old_thread: "false",
+      send_notification_to_new_thread: "false",
     });
   }
 }

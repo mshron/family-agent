@@ -1,6 +1,0 @@
-{
-  "defaultProvider": "openrouter",
-  "defaultModel": "z-ai/glm-5.3-flash",
-  "defaultThinkingLevel": "low",
-  "theme": "dark"
-}

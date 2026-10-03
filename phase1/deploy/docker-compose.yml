@@ -9,5 +9,5 @@ services:
     env_file: /opt/family-agent/.env
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - /opt/family-agent/workspace:/opt/family-agent/workspace
-      - /opt/family-agent/sessions:/opt/family-agent/sessions
+      - /opt/family-agent/workspaces:/opt/family-agent/workspaces
+      - /opt/family-agent/durable:/opt/family-agent/durable
