@@ -1,0 +1,27 @@
+name: deploy
+
+# CI/CD for the family-agent box: on push to main, ssh in and redeploy.
+# Requires repository secrets (Settings -> Secrets and variables -> Actions):
+#   DEPLOY_SSH_KEY  — private key of a deploy user on the box
+#   DEPLOY_KNOWN_HOSTS — output of `ssh-keyscan 128.140.54.129`
+#   DEPLOY_HOST     — 128.140.54.129 (default if unset)
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy over SSH
+        env:
+          KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          KNOWN: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+          HOST: ${{ secrets.DEPLOY_HOST || '128.140.54.129' }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$KNOWN" > ~/.ssh/known_hosts
+          echo "$KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh -i ~/.ssh/id_ed25519 root@"$HOST" 'bash -s' < phase1/deploy/pull-deploy.sh

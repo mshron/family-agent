@@ -216,7 +216,7 @@ const historySearchTool = defineTool({
 // ---------------------------------------------------------------------------
 // Threads: fork this conversation, or spawn a fresh subagent thread.
 
-export function buildZulipTools({ onThreadCreated }) {
+export function buildZulipTools({ onThreadCreated, onPushChanges }) {
   const spawnThreadTool = defineTool({
     name: "spawn_thread",
     description:
@@ -230,6 +230,9 @@ export function buildZulipTools({ onThreadCreated }) {
       const mine = await api.snapshot(ZulipDoc, api.conversationId, context);
       if (!mine?.stream) {
         return { content: [{ type: "text", text: "No channel mapping for this conversation." }] };
+      }
+      if (mine.stream === "dm") {
+        return { content: [{ type: "text", text: "spawn_thread is not available in direct messages (there are no topics to spawn)." }] };
       }
       let childId = await api.memo(`spawn:${args.topic}`, context);
       if (childId === undefined) {
@@ -271,6 +274,9 @@ export function buildZulipTools({ onThreadCreated }) {
       if (!mine?.stream) {
         return { content: [{ type: "text", text: "No channel mapping for this conversation." }] };
       }
+      if (mine.stream === "dm") {
+        return { content: [{ type: "text", text: "fork_thread is not available in direct messages (there are no topics to fork into)." }] };
+      }
       let forkId = await api.memo(`fork:${args.topic}`, context);
       if (forkId === undefined) {
         // Fork at the newest entry, inside a commit so the doc is set atomically.
@@ -303,8 +309,36 @@ export function buildZulipTools({ onThreadCreated }) {
     },
   });
 
+  // The meta channel's push: the gateway runs git push with a deploy key
+  // that lives only on the gateway side, so agents can trigger a push but
+  // never read the key.
+  const pushChangesTool = defineTool({
+    name: "push_changes",
+    description:
+      "Push the workspace repository's commits to the origin remote on GitHub (branch main). Run this after committing work that should deploy; CI/CD picks it up from there.",
+    parameters: Type.Object({}),
+    replay: "safe",
+    async execute(_args, api, context) {
+      const mine = await api.snapshot(ZulipDoc, api.conversationId, context);
+      if (!mine?.stream) {
+        return { content: [{ type: "text", text: "No channel mapping for this conversation." }] };
+      }
+      const out = await onPushChanges?.(api.conversationId, mine.stream);
+      return {
+        content: [{ type: "text", text: out ?? "push_changes is not available in this channel." }],
+      };
+    },
+  });
+
   return defineExtension({
     name: "zulip",
-    tools: [searchTool, summarizeTool, historySearchTool, spawnThreadTool, forkThreadTool],
+    tools: [
+      searchTool,
+      summarizeTool,
+      historySearchTool,
+      spawnThreadTool,
+      forkThreadTool,
+      pushChangesTool,
+    ],
   });
 }

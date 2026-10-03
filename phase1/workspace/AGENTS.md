@@ -11,6 +11,8 @@ your working memory across conversations.
   kebab-case names, for example `notes/zulip-gateway-plan.md`.
 - `docs/` — finished writeups that another conversation may need later.
   Name them `docs/YYYY-MM-DD-topic.md`.
+- `uploads/` — attachments the user sends (photos, files). They arrive
+  here before your turn starts; treat them as read-mostly context.
 - `memory/` — long-term memory that loads fresh into every message, in
   every conversation in this channel. There are two files:
   - `memory/user.md` — stable facts about the user, their preferences, and
@@ -29,6 +31,13 @@ your working memory across conversations.
   memory changes by reading the git history.
 - Search before you ask: `notes/` and `docs/` hold past work. Use
   `grep -ri <term> notes/ docs/` before doing something from scratch.
+
+## Skills
+
+- `/skills/` holds global skills; `/channel-skills/` holds skills for this
+  channel. Both are read-only. The skills section in your prompt lists what
+  is available; read a skill's `SKILL.md` when a task matches it.
+- Skills outside your prompt's list do not exist; do not guess paths.
 
 ## Threads and memory across conversations
 

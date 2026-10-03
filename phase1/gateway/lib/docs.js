@@ -10,7 +10,14 @@ export const ZulipDoc = defineDoc({
   history: "latest",
   // Forks and spawned threads get their own mapping, not the parent's.
   fork: "initial",
-  initial: () => ({ stream: null, topic: null, origin: null }),
+  initial: () => ({
+    stream: null,
+    topic: null,
+    origin: null,
+    // Direct-message conversations: the participants' emails (all, bot
+    // included). Null for stream conversations.
+    recipients: null,
+  }),
 });
 
 /** Gateway bookkeeping (general-chat naming boundaries), session-wide. */

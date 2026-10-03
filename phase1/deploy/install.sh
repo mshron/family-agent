@@ -10,10 +10,24 @@ if [ ! -f .env ]; then
 fi
 source .env
 
-# One workspace repo per channel (once). Single user memory per channel for
-# now; shared-user-memory promotion is a Phase 2+ decision.
-STREAMS="${SCRATCH_STREAM:-scratch}"
-for s in $STREAMS; do
+if ! command -v jq >/dev/null 2>&1; then
+  echo "ERROR: jq is required (apt-get install -y jq)" >&2
+  exit 1
+fi
+
+# Channels come from channels.json, the same file the gateway reads.
+CHANNELS_FILE="phase1/channels.json"
+mapfile -t STREAMS < <(jq -r '.streams[]' "$CHANNELS_FILE")
+
+# One workspace repo per channel (once), plus "dm" for direct messages.
+# meta is special: its workspace is a clone of the system repo, not the
+# skeleton (see the README before wiring it up).
+for s in "${STREAMS[@]}" dm; do
+  if [ "$s" = "meta" ] && [ -n "${META_REMOTE_URL:-}" ] && [ ! -d "workspaces/meta/.git" ]; then
+    git clone "$META_REMOTE_URL" workspaces/meta
+    echo "meta workspace cloned from $META_REMOTE_URL"
+    continue
+  fi
   if [ ! -d "workspaces/$s/.git" ]; then
     mkdir -p "workspaces/$s"
     cp -r phase1/workspace/. "workspaces/$s/"
@@ -25,6 +39,13 @@ for s in $STREAMS; do
   fi
 done
 mkdir -p durable
+
+# Skill layers: read-only for agents, one dir per layer.
+mkdir -p skills/global
+for s in "${STREAMS[@]}" dm; do mkdir -p "skills/$s"; done
+
+# Push secrets for the meta channel (deploy key + known_hosts), mode 600.
+mkdir -p secrets/push
 
 echo "building exec image..."
 docker build -q -t family-agent-exec:latest phase1/exec

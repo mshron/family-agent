@@ -23,6 +23,11 @@ The Zulip bot is the existing "Nanobot" bot user, on the private stream
 ## How it behaves
 
 - Every topic in `scratch` is one conversation with full coding tools.
+- **Thinking indicator.** The bot reacts to your message with :eyes: while the
+  run is live and removes the reaction when the reply posts.
+- **Attachments.** Files and photos posted in Zulip are downloaded into the
+  channel workspace's `uploads/` directory before the turn starts; the
+  message text the agent sees carries the local paths.
 - **Tool-call spoilers.** Each tool call posts one collapsible spoiler block
   in the topic (````spoiler <tool> — <args> ... result`). The gateway filters
   its own posts out of ingestion, so agents never see these in their
@@ -37,6 +42,16 @@ The Zulip bot is the existing "Nanobot" bot user, on the private stream
   the thread came from.
 - **`history_search`.** Channel-scoped search over past conversations
   (all topics, including pre-`/new` ones), with topic names in results.
+- **Direct messages.** A DM to the bot is one continuous conversation per
+  DM group (workspace: `dm`). Spoilers, reactions, commands, and uploads
+  work there; spawn/fork do not (DMs have no topics).
+- **Channels.** `phase1/channels.json` lists the streams the gateway ingests
+  and the tool set each channel gets (`tools` replaces, `add` appends to the
+  standard set). Changing it needs a gateway restart, not a rebuild.
+- **Skills.** Two read-only layers mounted into every exec container:
+  `/skills` (global) and `/channel-skills` (this channel). Install with
+  `phase1/skills/install.sh <git-url-or-path> [--global | --channel NAME]`.
+  A `skills` prompt section lists what is available.
 - **Search.** `search` and `summarize_url` (Brave today; Kagi when the key
   is available).
 
@@ -79,6 +94,30 @@ untrusted text entering a conversation. When Phase 2 lands, rotate
 everything Phase 1 could have seen: the Zulip bot key and the OpenRouter key.
 (While debugging the Zulip event API, the bot key appeared in base64 in a
 terminal transcript — one more reason to rotate at Phase 2.)
+
+## The #meta channel (self-modification)
+
+`meta` is where the system can work on itself. Its workspace is a git clone
+of the family-agent repo, so agents there edit real code with the normal
+  tools, and `push_changes` runs `git push origin main` with a deploy key that
+lives only in the gateway (agents can trigger a push, never read the key).
+A push triggers the GitHub Actions workflow (`.github/workflows/deploy.yml`)
+which sshes to the box and runs `phase1/deploy/pull-deploy.sh` (git pull in
+the meta workspace, rsync `phase1/`, redeploy). Secrets stay outside the
+repo tree on the box.
+
+One-time wiring (needs your GitHub account):
+1. Create the GitHub repo, push this code, add the deploy key
+   (`ssh-keygen -t ed25519 -f /opt/family-agent/secrets/push/id_ed25519`,
+   public half to GitHub as a write deploy key, `ssh-keyscan github.com`
+   into `secrets/push/known_hosts`, both mode 600).
+2. Replace the meta workspace with a clone:
+   `git clone <repo> /opt/family-agent/workspaces/meta` (keep the old dir if
+   you want it). Set `origin` in that clone to the GitHub repo.
+3. Add the Actions secrets `DEPLOY_SSH_KEY`, `DEPLOY_KNOWN_HOSTS`, `DEPLOY_HOST`
+   (a key for root ssh on the box).
+
+Until then `push_changes` answers that push is not configured.
 
 ## Known limitations (accepted for the feel test)
 

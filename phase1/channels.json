@@ -1,0 +1,11 @@
+{
+  "streams": ["scratch", "meta"],
+  "channels": {
+    "scratch": {},
+    "meta": {
+      "add": ["push_changes"],
+      "push": true
+    },
+    "dm": {}
+  }
+}

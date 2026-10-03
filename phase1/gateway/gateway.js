@@ -10,7 +10,8 @@
 
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdir } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { Harness } from "@earendil-works/pi-durable";
@@ -23,7 +24,13 @@ import { Zulip } from "./lib/zulip.js";
 import { buildModels, MODEL_ALIASES, smallLlm } from "./lib/models.js";
 import { DockerExecutionEnv } from "./lib/docker-env.js";
 import { ZulipDoc, GatewayDoc } from "./lib/docs.js";
-import { conventionsSection, memorySection, workspaceDir } from "./lib/sections.js";
+import {
+  conventionsSection,
+  memorySection,
+  skillsSection,
+  workspaceDir,
+} from "./lib/sections.js";
+import { loadChannelConfig } from "./lib/channels.js";
 import { buildZulipTools } from "./lib/tools.js";
 import { GENERAL_CHAT, nameTopic } from "./lib/naming.js";
 
@@ -59,10 +66,12 @@ const env = {
   ZULIP_SITE: requireEnv("ZULIP_SITE"),
   ZULIP_EMAIL: requireEnv("ZULIP_EMAIL"),
   ZULIP_API_KEY: requireEnv("ZULIP_API_KEY"),
-  SCRATCH_STREAM: process.env.SCRATCH_STREAM || "scratch",
   EXEC_IMAGE: process.env.EXEC_IMAGE || "family-agent-exec:latest",
   WORKSPACES_DIR: process.env.WORKSPACES_DIR || "/opt/family-agent/workspaces",
   DURABLE_DIR: process.env.DURABLE_DIR || "/opt/family-agent/durable",
+  SKILLS_DIR: process.env.SKILLS_DIR || "/opt/family-agent/skills",
+  SECRETS_DIR: process.env.SECRETS_DIR || "/opt/family-agent/secrets",
+  CHANNELS_FILE: process.env.CHANNELS_FILE || "/app/channels.json",
   OPENROUTER_API_KEY: requireEnv("OPENROUTER_API_KEY"),
   IDLE_MINUTES: Number(process.env.IDLE_MINUTES) || IDLE_MINUTES,
   ZULIP_OWNER_EMAILS: (process.env.ZULIP_OWNER_EMAILS || "")
@@ -77,6 +86,7 @@ const zulip = new Zulip({
   email: env.ZULIP_EMAIL,
   apiKey: env.ZULIP_API_KEY,
 });
+const channelConfig = await loadChannelConfig(env.CHANNELS_FILE);
 
 // ---------------------------------------------------------------------------
 // Docker helpers (run in the gateway container, over the mounted socket)
@@ -107,11 +117,17 @@ async function ensureExecContainer(conversationId, stream) {
   const state = await sh(["inspect", "-f", "{{.State.Running}}", name]);
   if (state.code === 0 && state.stdout.trim() === "true") return name;
   if (state.code === 0) await sh(["rm", "-f", name]);
+  // Read-only skill layers on top of the writable workspace.
+  const mounts = ["-v", `${workspaceDir(env, stream)}:/workspace`];
+  const globalSkills = path.join(env.SKILLS_DIR, "global");
+  const channelSkills = path.join(env.SKILLS_DIR, stream);
+  if (existsSync(globalSkills)) mounts.push("-v", `${globalSkills}:/skills:ro`);
+  if (existsSync(channelSkills)) mounts.push("-v", `${channelSkills}:/channel-skills:ro`);
   const run = await sh([
     "run", "-d", "--rm",
     "--name", name,
     "--label", "family-agent-exec=1",
-    "-v", `${workspaceDir(env, stream)}:/workspace`,
+    ...mounts,
     "-w", "/workspace",
     env.EXEC_IMAGE,
     "sleep", "infinity",
@@ -120,12 +136,39 @@ async function ensureExecContainer(conversationId, stream) {
   return name;
 }
 
+/**
+ * The meta channel's git push. The deploy key lives in SECRETS_DIR, which is
+ * mounted only into the gateway and these one-off push containers — never
+ * into exec containers, so agents can trigger a push but cannot read the key.
+ */
+async function pushWorkspaceToOrigin(conversationId, stream) {
+  if (!channelConfig.channels[stream]?.push) return undefined;
+  const ws = workspaceDir(env, stream);
+  const keyDir = path.join(env.SECRETS_DIR, "push");
+  if (!existsSync(path.join(keyDir, "id_ed25519"))) {
+    return "push is not configured: no deploy key at secrets/push/id_ed25519 (see deploy docs).";
+  }
+  const run = await sh([
+    "run", "--rm",
+    "-v", `${ws}:/workspace`,
+    "-v", `${keyDir}:/root/.ssh:ro`,
+    "-e", "GIT_SSH_COMMAND=ssh -i /root/.ssh/id_ed25519 -o UserKnownHostsFile=/root/.ssh/known_hosts -o StrictHostKeyChecking=yes",
+    "-w", "/workspace",
+    env.EXEC_IMAGE,
+    "git", "push", "origin", "HEAD:main",
+  ]);
+  const text = `${run.stdout || ""}${run.stderr || ""}`.trim().slice(0, 600);
+  return run.code === 0
+    ? `Pushed to origin main.\n${text}`
+    : `Push failed:\n${text}`;
+}
+
 // ---------------------------------------------------------------------------
 // Harness wiring
 
 const FamilySections = defineExtension({
   name: "family",
-  sections: [conventionsSection(env), memorySection(env)],
+  sections: [conventionsSection(env), memorySection(env), skillsSection(env)],
 });
 
 const ZulipTools = buildZulipTools({
@@ -141,12 +184,18 @@ const ZulipTools = buildZulipTools({
     );
     if (mapping.task) void runSpawnedThread(conversationId, mapping);
   },
+  onPushChanges: pushWorkspaceToOrigin,
 });
 
 const registry = createRegistry();
 registry.install(CodingTools);
 registry.install(ZulipTools);
 registry.install(FamilySections);
+
+/** Name -> ToolRegistration, for per-channel tool selection. */
+const toolByName = new Map(
+  [...CodingTools.tools, ...ZulipTools.tools].map((t) => [t.name, t])
+);
 
 const storage = await openNodeJsonlStorage(env.DURABLE_DIR, context, { fsync: true });
 const harness = await Harness.open(
@@ -178,11 +227,39 @@ const harness = await Harness.open(
 harness.resume();
 
 // ---------------------------------------------------------------------------
-// Conversation bookkeeping
+// Routes: every inbound message becomes a route (stream topic or DM group)
+// that carries its conversation key, its channel, and how to reply.
 
-/** conversationId -> { stream, topic } */
+function streamRoute(stream, topic) {
+  return {
+    kind: "stream",
+    stream,
+    topic,
+    conversationKey: `${stream}::${topic}`,
+    channel: stream, // workspace + channel-config key
+    reply: (content) => zulip.sendStreamMessage(stream, topic, content),
+  };
+}
+
+function dmRoute(message) {
+  const recipients = message.display_recipient || [];
+  const others = recipients.filter((r) => r.id !== botUserId);
+  const groupKey = "dm-" + others.map((r) => r.id).sort().join("-");
+  const emails = recipients.map((r) => r.email);
+  return {
+    kind: "dm",
+    stream: "dm",
+    topic: groupKey,
+    conversationKey: `dm::${groupKey}`,
+    channel: "dm",
+    replyRecipients: emails,
+    reply: (content) => zulip.sendPrivateMessage(emails, content),
+  };
+}
+
+/** conversationId -> { stream, topic, recipients? } */
 const byId = new Map();
-/** `${stream}::${topic}` -> conversationId */
+/** conversationKey -> conversationId */
 const byTopic = new Map();
 /** conversationId -> { events, toolCalls, lastActivity } */
 const watchers = new Map();
@@ -191,7 +268,12 @@ function registerConversation(conversationId, mapping) {
   const existing = byId.get(conversationId);
   byId.set(conversationId, mapping);
   if (existing?.topic !== mapping.topic) {
-    byTopic.set(`${mapping.stream}::${mapping.topic}`, conversationId);
+    byTopic.set(
+      mapping.stream === "dm"
+        ? `dm::${mapping.topic}`
+        : `${mapping.stream}::${mapping.topic}`,
+      conversationId
+    );
   }
 }
 
@@ -205,7 +287,11 @@ async function bootScan() {
     for (const record of page.items) {
       const doc = await harness.snapshot(ZulipDoc, record.id, context);
       if (doc?.stream && doc?.topic) {
-        registerConversation(record.id, { stream: doc.stream, topic: doc.topic });
+        registerConversation(record.id, {
+          stream: doc.stream,
+          topic: doc.topic,
+          ...(doc.recipients ? { recipients: doc.recipients } : {}),
+        });
       }
     }
     cursor = page.next;
@@ -223,34 +309,53 @@ const INSTRUCTIONS = [
   "history_search finds past conversations in this channel; spawn_thread and fork_thread create new topics.",
 ].join(" ");
 
-async function ensureTopicConversation(stream, topic) {
-  const key = `${stream}::${topic}`;
-  const existing = byTopic.get(key);
+const INSTRUCTIONS_DM = [
+  "You are Max's personal assistant. You run inside one direct-message thread.",
+  "Your final reply text is posted to that thread as-is, so answer directly and completely.",
+  "Follow the workspace conventions in the conventions section: notes in notes/, writeups in docs/,",
+  "durable facts in memory/ (say in your reply when you change memory).",
+  "history_search finds past conversations in direct messages; there are no topics here, so spawn_thread and fork_thread do not apply.",
+].join(" ");
+
+async function ensureConversation(route) {
+  const existing = byTopic.get(route.conversationKey);
   if (existing) {
     const conv = await harness.conversation(existing, context);
     if (conv) return conv;
-    byTopic.delete(key);
+    byTopic.delete(route.conversationKey);
     byId.delete(existing);
   }
+  const docInit =
+    route.kind === "dm"
+      ? { stream: "dm", topic: route.topic, recipients: route.replyRecipients }
+      : { stream: route.stream, topic: route.topic };
+  const tools = channelConfig
+    .toolsFor(route.channel)
+    .map((name) => toolByName.get(name))
+    .filter(Boolean);
   const created = await harness.createConversation(
     {
       ownership: { kind: "ownerless" },
       agent: {
         model: MODEL_ALIASES.flash,
         thinkingLevel: "low",
-        instructions: INSTRUCTIONS,
+        instructions: route.kind === "dm" ? INSTRUCTIONS_DM : INSTRUCTIONS,
+        tools,
       },
       init: async (tx, id) => {
         const doc = await tx.doc(ZulipDoc, id);
-        doc.stream = stream;
-        doc.topic = topic;
+        Object.assign(doc, docInit);
         doc.model = "auto";
       },
     },
     context
   );
-  registerConversation(created.id, { stream, topic });
-  log.info(`conversation created for ${key}: ${created.id}`);
+  registerConversation(created.id, {
+    stream: docInit.stream,
+    topic: docInit.topic,
+    ...(docInit.recipients ? { recipients: docInit.recipients } : {}),
+  });
+  log.info(`conversation created for ${route.conversationKey}: ${created.id}`);
   return created;
 }
 
@@ -315,7 +420,11 @@ async function postSpoiler(conversationId, toolName, args, resultText) {
   const body = (resultText || "(no output)").slice(0, SPOILER_RESULT_LIMIT);
   const content = "```spoiler " + header + "\n" + body + "\n```";
   try {
-    await zulip.sendStreamMessage(mapping.stream, mapping.topic, content);
+    if (mapping.recipients) {
+      await zulip.sendPrivateMessage(mapping.recipients, content);
+    } else {
+      await zulip.sendStreamMessage(mapping.stream, mapping.topic, content);
+    }
   } catch (err) {
     log.warn(`spoiler post failed (${mapping.topic}): ${err.message}`);
   }
@@ -412,50 +521,87 @@ async function runSpawnedThread(conversationId, mapping) {
   }
 }
 
-async function promptTopic(stream, topic, message) {
-  const conversation = await ensureTopicConversation(stream, topic);
+/** Download /user_uploads attachments into the channel workspace. */
+async function ingestUploads(route, message) {
+  const content = message.content || "";
+  const urls = [
+    ...new Set(
+      [...content.matchAll(/\]\((\/user_uploads\/[^)\s]+)\)/g)].map((m) => m[1])
+    ),
+  ];
+  if (urls.length === 0) return content;
+  const dir = path.join(workspaceDir(env, route.channel), "uploads");
+  await mkdir(dir, { recursive: true });
+  const saved = [];
+  let out = content;
+  for (const url of urls) {
+    try {
+      const { bytes, name } = await zulip.downloadFile(url);
+      const fname = `${message.id}-${name.replace(/[\/\\]/g, "_")}`;
+      await writeFile(path.join(dir, fname), bytes);
+      out = out.split(url).join(`uploads/${fname}`);
+      saved.push(`uploads/${fname}`);
+    } catch (err) {
+      log.warn(`upload download failed (${url.slice(0, 60)}): ${err.message}`);
+    }
+  }
+  if (saved.length > 0) {
+    out += `\n\n(attachments saved into the workspace: ${saved.join(", ")})`;
+  }
+  return out;
+}
+
+/** One user message -> one conversation turn, with a thinking indicator. */
+async function promptRoute(route, message) {
+  const conversation = await ensureConversation(route);
   await ensureWatcher(conversation.id);
-  const doc = await harness.snapshot(ZulipDoc, conversation.id, context);
-  await applyAutoModel(conversation, doc, message.content);
-  const submission = await conversation.submit(
-    {
-      type: "input",
-      content: message.content,
-      requestId: `zulip:${message.id}`,
-      whenBusy: "followUp",
-    },
-    context
-  );
-  const settled = await submission.wait(context);
-  log.info(
-    `settled: ${JSON.stringify(settled).slice(0, 400)}`
-  );
-  const answer = await extractAnswer(conversation, settled);
-  const content =
-    answer.length > REPLY_CHAR_LIMIT
-      ? `${answer.slice(0, REPLY_CHAR_LIMIT)}\n\n*(truncated — the full text is in the workspace)*`
-      : answer;
-  await zulip.sendStreamMessage(stream, topic, content);
-  log.info(`reply posted (${content.length} chars) -> ${stream}::${topic}`);
+  const content = await ingestUploads(route, message);
+  // Thinking indicator: an eyes reaction while the run is live, removed
+  // when the reply posts (streams and DMs both).
+  await zulip.addReaction(message.id, "eyes").catch(() => {});
+  try {
+    const doc = await harness.snapshot(ZulipDoc, conversation.id, context);
+    await applyAutoModel(conversation, doc, content);
+    const submission = await conversation.submit(
+      {
+        type: "input",
+        content,
+        requestId: `zulip:${message.id}`,
+        whenBusy: "followUp",
+      },
+      context
+    );
+    const settled = await submission.wait(context);
+    log.info(`settled: ${JSON.stringify(settled).slice(0, 400)}`);
+    const answer = await extractAnswer(conversation, settled);
+    const reply =
+      answer.length > REPLY_CHAR_LIMIT
+        ? `${answer.slice(0, REPLY_CHAR_LIMIT)}\n\n*(truncated — the full text is in the workspace)*`
+        : answer;
+    await route.reply(reply);
+    log.info(`reply posted (${reply.length} chars) -> ${route.conversationKey}`);
+  } finally {
+    await zulip.removeReaction(message.id, "eyes").catch(() => {});
+  }
 }
 
 // ---------------------------------------------------------------------------
 // Commands
 
-async function handleCommand(stream, topic, content) {
+async function handleCommand(route, content) {
   const trimmed = content.trim();
   const [rawCmd, ...rest] = trimmed.slice(1).split(/\s+/);
   const cmd = rawCmd.toLowerCase();
   const argStr = trimmed.slice(1 + rawCmd.length).trim();
 
   const say = (text) =>
-    zulip.sendStreamMessage(stream, topic, text).catch((err) =>
-      log.error(`failed to post to ${stream}/${topic}: ${err.message}`)
+    route.reply(text).catch((err) =>
+      log.error(`failed to post to ${route.conversationKey}: ${err.message}`)
     );
 
   switch (cmd) {
     case "new": {
-      const conversation = await ensureTopicConversation(stream, topic);
+      const conversation = await ensureConversation(route);
       const date = new Date().toISOString().slice(0, 10);
       const note = `notes/handoff-${date}-${containerHash(conversation.id)}.md`;
       const handoffPrompt =
@@ -479,19 +625,19 @@ async function handleCommand(stream, topic, content) {
       return true;
     }
     case "compact": {
-      const conversation = await ensureTopicConversation(stream, topic);
+      const conversation = await ensureConversation(route);
       await conversation.compact(null, context);
       await say("Compaction scheduled; it places the summary at the next turn boundary.");
       return true;
     }
     case "stop": {
-      const conversation = await ensureTopicConversation(stream, topic);
+      const conversation = await ensureConversation(route);
       await conversation.abort(context);
       await say("Stopped.");
       return true;
     }
     case "stats": {
-      const id = byTopic.get(`${stream}::${topic}`);
+      const id = byTopic.get(route.conversationKey);
       const conversation = id ? await harness.conversation(id, context) : undefined;
       if (!conversation) {
         await say("No conversation for this topic yet; send a message first.");
@@ -522,7 +668,7 @@ async function handleCommand(stream, topic, content) {
         await say(`Unknown model "${parts[0]}". Use auto, flash, or strong.`);
         return true;
       }
-      const conversation = await ensureTopicConversation(stream, topic);
+      const conversation = await ensureConversation(route);
       const id = conversation.id;
       if (choice !== "auto") {
         await conversation.configure(
@@ -625,11 +771,12 @@ async function routeGeneralChat(message) {
 
 let botUserId = null;
 
-async function onMessage(message) {
+async function onStreamMessage(message) {
   const stream = message.display_recipient;
   let topic = message.subject;
   const content = (message.content || "").trim();
   if (!content) return;
+  let route;
 
   try {
     if (topic === GENERAL_CHAT) {
@@ -640,60 +787,112 @@ async function onMessage(message) {
         return;
       }
     }
-    log.info(`message from ${message.sender_full_name} in ${stream}/${topic}: ${stripHtml(content).slice(0, 100)}`);
+    route = streamRoute(stream, topic);
+    log.info(
+      `message from ${message.sender_full_name} in ${stream}/${topic}: ${content.slice(0, 100)}`
+    );
     if (content.startsWith("/")) {
-      const handled = await handleCommand(stream, topic, content);
+      const handled = await handleCommand(route, content);
       if (handled) return;
     }
-    await promptTopic(stream, topic, message);
+    await promptRoute(route, message);
   } catch (err) {
     log.error(`handling message in ${stream}/${topic} failed: ${err.message}`);
-    zulip.sendStreamMessage(stream, topic, `Gateway error: ${err.message}`).catch(() => {});
+    route
+      ? route.reply(`Gateway error: ${err.message}`).catch(() => {})
+      : zulip.sendStreamMessage(stream, topic, `Gateway error: ${err.message}`).catch(() => {});
   }
+}
+
+async function onDmMessage(message) {
+  const content = (message.content || "").trim();
+  if (!content) return;
+  const route = dmRoute(message);
+  try {
+    log.info(
+      `direct message from ${message.sender_full_name} (${route.conversationKey}): ${content.slice(0, 100)}`
+    );
+    if (content.startsWith("/")) {
+      const handled = await handleCommand(route, content);
+      if (handled) return;
+    }
+    await promptRoute(route, message);
+  } catch (err) {
+    log.error(`handling direct message ${route.conversationKey} failed: ${err.message}`);
+    route.reply(`Gateway error: ${err.message}`).catch(() => {});
+  }
+}
+
+async function onMessage(message) {
+  if (message.type === "private") return onDmMessage(message);
+  return onStreamMessage(message);
 }
 
 async function ensureStreamAccess() {
-  try {
-    await zulip.subscribeSelf(
-      env.SCRATCH_STREAM,
-      "Phase 1 feel test: gateway + pi-durable sessions"
-    );
-    log.info(`subscribed bot to stream "${env.SCRATCH_STREAM}"`);
-  } catch (err) {
-    log.warn(`could not subscribe to "${env.SCRATCH_STREAM}": ${err.message}`);
-  }
-  if (env.ZULIP_OWNER_EMAILS.length > 0) {
-    const out = await zulip.subscribeOthers(env.SCRATCH_STREAM, env.ZULIP_OWNER_EMAILS);
-    if (out.added.length > 0) log.info(`added to stream: ${out.added.join(", ")}`);
-    else if (out.msg) log.warn(`could not add owners to stream: ${out.msg}`);
+  for (const stream of channelConfig.streams) {
+    try {
+      await zulip.subscribeSelf(
+        stream,
+        "family-agent channel (personal assistant)"
+      );
+      log.info(`subscribed bot to stream "${stream}"`);
+    } catch (err) {
+      log.warn(
+        `could not subscribe to "${stream}" (${err.message}). Create the stream first, then restart the gateway.`
+      );
+    }
+    if (env.ZULIP_OWNER_EMAILS.length > 0) {
+      const out = await zulip.subscribeOthers(stream, env.ZULIP_OWNER_EMAILS);
+      if (out.added.length > 0) log.info(`added to stream ${stream}: ${out.added.join(", ")}`);
+    }
   }
 }
 
-async function pollLoop() {
-  let queueId = null;
-  let lastEventId = -1;
+/**
+ * One independent poller per stream queue plus one for direct messages.
+ * Each queue polls in its own loop, and message handling is fire-and-forget:
+ * a long conversation run never delays event pickup for any queue.
+ */
+async function pollQueueForever(q) {
   for (;;) {
-    if (!queueId) {
-      const reg = await zulip.register(env.SCRATCH_STREAM);
-      queueId = reg.queue_id;
-      lastEventId = reg.last_event_id;
-      log.info(`event queue registered: ${queueId}`);
-    }
     try {
-      const { events, lastEventId: newest } = await zulip.getEvents(queueId, lastEventId);
-      lastEventId = newest;
+      if (!q.queueId) {
+        const reg =
+          q.kind === "private"
+            ? await zulip.registerPrivateQueue()
+            : await zulip.registerStreamQueue(q.stream);
+        q.queueId = reg.queue_id;
+        q.lastEventId = reg.last_event_id;
+        log.info(`event queue registered (${q.kind}${q.stream ? ":" + q.stream : ""}): ${q.queueId.slice(0, 8)}`);
+      }
+      const { events, lastEventId: newest } = await zulip.getEvents(q.queueId, q.lastEventId);
+      q.lastEventId = newest;
       for (const event of events) {
         if (event.type !== "message") continue;
         const message = event.message;
         if (botUserId !== null && message.sender_id === botUserId) continue;
-        await onMessage(message);
+        void onMessage(message).catch((err) =>
+          log.error(`onMessage failed (${q.kind}${q.stream ? ":" + q.stream : ""}): ${err.message}`)
+        );
       }
     } catch (err) {
-      log.warn(`events poll failed: ${err.message}; re-registering`);
-      queueId = null;
+      log.warn(`events poll failed (${q.kind}${q.stream ? ":" + q.stream : ""}): ${err.message}; re-registering`);
+      q.queueId = null;
       await new Promise((r) => setTimeout(r, 3000));
     }
   }
+}
+
+function pollLoop() {
+  const queues = channelConfig.streams.map((stream) => ({
+    kind: "stream",
+    stream,
+    queueId: null,
+    lastEventId: -1,
+  }));
+  queues.push({ kind: "private", queueId: null, lastEventId: -1 });
+  for (const q of queues) void pollQueueForever(q);
+  return new Promise(() => {}); // runs forever
 }
 
 // ---------------------------------------------------------------------------
@@ -721,7 +920,9 @@ async function main() {
   const me = await zulip.getMe();
   botUserId = me.user_id;
   log.info(`gateway bot: ${me.full_name} <${me.email}> (user_id ${botUserId})`);
-  await mkdir(path.join(env.WORKSPACES_DIR, env.SCRATCH_STREAM), { recursive: true });
+  for (const dir of [...channelConfig.streams, "dm"]) {
+    await mkdir(path.join(env.WORKSPACES_DIR, dir), { recursive: true });
+  }
   await ensureStreamAccess();
 
   const shutdown = async (sig) => {
