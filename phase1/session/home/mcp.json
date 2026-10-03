@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "search": {
+      "command": "node",
+      "args": ["/opt/pi-mcp/search-server.js"],
+      "env": {
+        "SEARCH_PROVIDER": "${SEARCH_PROVIDER}",
+        "KAGI_API_KEY": "${KAGI_API_KEY}",
+        "BRAVE_API_KEY": "${BRAVE_API_KEY}"
+      },
+      "description": "Web search (Kagi or Brave by SEARCH_PROVIDER), with page summarization on Kagi."
+    }
+  }
+}

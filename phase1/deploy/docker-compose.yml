@@ -1,0 +1,13 @@
+name: family-agent
+
+services:
+  gateway:
+    build: ../gateway
+    image: family-agent-gateway:latest
+    container_name: fa-gateway
+    restart: unless-stopped
+    env_file: /opt/family-agent/.env
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /opt/family-agent/workspace:/opt/family-agent/workspace
+      - /opt/family-agent/sessions:/opt/family-agent/sessions
