@@ -6,9 +6,34 @@
 // Wire format: one JSON object per line. Requests may be notifications
 // (no `id`) which take no response.
 
-const PROVIDER = process.env.SEARCH_PROVIDER || "brave";
-const KAGI_KEY = process.env.KAGI_API_KEY || "";
-const BRAVE_KEY = process.env.BRAVE_API_KEY || "";
+// Configuration: SEARCH_CONFIG (JSON: {provider, kagi_key, brave_key})
+// from the gateway, or the individual SEARCH_PROVIDER / KAGI_API_KEY /
+// BRAVE_API_KEY variables for manual runs.
+// pi refuses to start the server when a referenced env variable is empty,
+// so the gateway passes one combined, always-set variable.
+const CONFIG = (() => {
+  if (process.env.SEARCH_CONFIG) {
+    try {
+      const c = JSON.parse(process.env.SEARCH_CONFIG);
+      return {
+        provider: c.provider || "brave",
+        kagiKey: c.kagi_key || "",
+        braveKey: c.brave_key || "",
+      };
+    } catch {
+      // fall through to individual variables
+    }
+  }
+  return {
+    provider: process.env.SEARCH_PROVIDER || "brave",
+    kagiKey: process.env.KAGI_API_KEY || "",
+    braveKey: process.env.BRAVE_API_KEY || "",
+  };
+})();
+
+const PROVIDER = CONFIG.provider;
+const KAGI_KEY = CONFIG.kagiKey;
+const BRAVE_KEY = CONFIG.braveKey;
 
 function log(...args) {
   // MCP stdio reserves stdout for protocol; logs go to stderr.

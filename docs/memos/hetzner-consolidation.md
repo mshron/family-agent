@@ -225,6 +225,8 @@ Still open at provision time: finance data residency (open question 8 — does n
 ### Phase 1 — Feel test: interaction and memory, nothing else
 
 > **Status (3 Oct): built, deployed to the code box, and verified end to end** — gateway, session containers, memory model, `auto` routing, search MCP, `/new` handoffs, and restart durability. Runbook and morning steps: `phase1/README.md`.
+>
+> **Substrate note:** Phase 1 runs on **plain pi sessions** (session files + RPC mode), not Pi Durable. The gateway owns the (stream, topic) → conversation mapping, the `/new` reset, and idle recycling. What is missing versus Pi Durable: checkpointed model/tool calls, exactly-once `requestId` submission, typed documents, and conversation forking. That is acceptable for the feel test (the interaction and memory model are substrate-independent), but Phase 2 must decide before hardening: migrate the session-manager internals to `@earendil-works/pi-durable` (on npm, v1.0.0), or consciously keep the homegrown layer. The Zulip adapter and memory files port unchanged either way.
 
 The point of Phase 1 is to learn whether the Zulip↔session interaction and the memory model feel right — before any security machinery exists. It deliberately runs ahead of the controls in the Threat model; that is survivable because of what Phase 1 omits, not because running bare is safe in general.
 

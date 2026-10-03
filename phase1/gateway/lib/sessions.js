@@ -28,6 +28,16 @@ export class SessionManager extends EventTarget {
     return createHash("sha1").update(key).digest("hex").slice(0, 12);
   }
 
+  /** One always-set JSON env var; pi rejects servers whose env references
+   *  an empty variable, so keys must not be passed individually. */
+  _searchConfig() {
+    return JSON.stringify({
+      provider: this.env.SEARCH_PROVIDER || "brave",
+      kagi_key: this.env.KAGI_API_KEY || "",
+      brave_key: this.env.BRAVE_API_KEY || "",
+    });
+  }
+
   _label(stream, topic) {
     return `${stream}/${topic}`.slice(0, 100);
   }
@@ -46,9 +56,7 @@ export class SessionManager extends EventTarget {
       "-v", `${this.env.SESSIONS_DIR}:/sessions`,
       "-w", "/workspace",
       "-e", `OPENROUTER_API_KEY=${this.env.OPENROUTER_API_KEY}`,
-      "-e", `SEARCH_PROVIDER=${this.env.SEARCH_PROVIDER}`,
-      "-e", `KAGI_API_KEY=${this.env.KAGI_API_KEY || ""}`,
-      "-e", `BRAVE_API_KEY=${this.env.BRAVE_API_KEY || ""}`,
+      "-e", `SEARCH_CONFIG=${this._searchConfig()}`,
       "-e", `TZ=${this.env.TZ || "UTC"}`,
       this.env.SESSION_IMAGE,
       "pi", "--mode", "rpc",
