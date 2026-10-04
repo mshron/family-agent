@@ -900,7 +900,9 @@ function pollLoop() {
 
 setInterval(async () => {
   const cutoff = Date.now() - env.IDLE_MINUTES * 60_000;
+  const live = new Set();
   for (const [conversationId, state] of [...watchers.entries()]) {
+    live.add(`fa-exec-${containerHash(conversationId)}`);
     if (state.lastActivity >= cutoff) continue;
     watchers.delete(conversationId);
     try {
@@ -911,6 +913,18 @@ setInterval(async () => {
     await sh(["rm", "-f", `fa-exec-${containerHash(conversationId)}`]);
     const mapping = byId.get(conversationId);
     if (mapping) log.info(`idle: watcher stopped for ${mapping.stream}::${mapping.topic}`);
+  }
+  // Exec containers whose watcher is gone (a gateway restart orphans every
+  // one, and CI/CD deploys restart the gateway): remove them. They respawn
+  // on demand.
+  const listed = await sh([
+    "ps", "--filter", "label=family-agent-exec", "--format", "{{.Names}}",
+  ]);
+  for (const name of listed.stdout.split("\n").map((s) => s.trim()).filter(Boolean)) {
+    if (!live.has(name)) {
+      await sh(["rm", "-f", name]);
+      log.info(`idle: removed orphaned exec container ${name}`);
+    }
   }
 }, 60_000).unref();
 

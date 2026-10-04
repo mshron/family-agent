@@ -99,25 +99,99 @@ terminal transcript — one more reason to rotate at Phase 2.)
 
 `meta` is where the system can work on itself. Its workspace is a git clone
 of the family-agent repo, so agents there edit real code with the normal
-  tools, and `push_changes` runs `git push origin main` with a deploy key that
-lives only in the gateway (agents can trigger a push, never read the key).
-A push triggers the GitHub Actions workflow (`.github/workflows/deploy.yml`)
-which sshes to the box and runs `phase1/deploy/pull-deploy.sh` (git pull in
-the meta workspace, rsync `phase1/`, redeploy). Secrets stay outside the
-repo tree on the box.
+tools, and `push_changes` runs `git push origin main` with a deploy key that
+lives only on the box's gateway side (agents can trigger a push, never read
+the key). A push triggers the GitHub Actions workflow
+(`.github/workflows/deploy.yml`) which connects to the box and runs
+`phase1/deploy/pull-deploy.sh` (reset the meta clone to `origin/main`, rsync
+`phase1/`, redeploy). Secrets stay outside the repo tree on the box.
 
-One-time wiring (needs your GitHub account):
-1. Create the GitHub repo, push this code, add the deploy key
-   (`ssh-keygen -t ed25519 -f /opt/family-agent/secrets/push/id_ed25519`,
-   public half to GitHub as a write deploy key, `ssh-keyscan github.com`
-   into `secrets/push/known_hosts`, both mode 600).
-2. Replace the meta workspace with a clone:
-   `git clone <repo> /opt/family-agent/workspaces/meta` (keep the old dir if
-   you want it). Set `origin` in that clone to the GitHub repo.
-3. Add the Actions secrets `DEPLOY_SSH_KEY`, `DEPLOY_KNOWN_HOSTS`, `DEPLOY_HOST`
-   (a key for root ssh on the box).
+Two keys, two directions — do not reuse one for the other:
 
-Until then `push_changes` answers that push is not configured.
+- **Deploy key** (box → GitHub): write access to this repo only. Lives in
+  `/opt/family-agent/secrets/push/` on the box; the gateway mounts it
+  read-only into a one-shot push container. Agents never see it.
+- **CI key** (GitHub runner → box): ssh to `root` on the box. Its private
+  half is the `DEPLOY_SSH_KEY` Actions secret; its public half is in the
+  box's `authorized_keys`.
+
+`/opt/family-agent` and everything under it is runtime state that exists
+only on the box — never in the repo.
+
+### Wiring step 1 — deploy key (run on the box)
+
+```bash
+ssh root@128.140.54.129
+install -d -m 700 /opt/family-agent/secrets/push
+ssh-keygen -t ed25519 -N '' -C 'family-agent meta push' \
+  -f /opt/family-agent/secrets/push/id_ed25519
+ssh-keyscan -t ed25519 github.com > /opt/family-agent/secrets/push/known_hosts
+# verify against GitHub's published fingerprints
+# (docs.github.com ... githubs-ssh-key-fingerprints):
+ssh-keygen -lf /opt/family-agent/secrets/push/known_hosts
+chmod 600 /opt/family-agent/secrets/push/*
+cat /opt/family-agent/secrets/push/id_ed25519.pub
+```
+
+Then register the public half: repo → Settings → Deploy keys → Add deploy
+key → paste → **check "Allow write access"**. With `gh`:
+`gh repo deploy-key add <pub-file> --title 'family-agent box' --allow-write`.
+
+### Wiring step 2 — meta workspace = repo clone (run on the box)
+
+```bash
+cd /opt/family-agent/workspaces
+mv meta meta.skeleton.bak
+GIT_SSH_COMMAND="ssh -i /opt/family-agent/secrets/push/id_ed25519 \
+  -o UserKnownHostsFile=/opt/family-agent/secrets/push/known_hosts \
+  -o StrictHostKeyChecking=yes" \
+  git clone git@github.com:mshron/family-agent.git meta
+cd meta
+git config user.name 'family-agent (#meta)'
+git config user.email 'meta@family-agent.local'
+git config core.sshCommand "ssh -i /opt/family-agent/secrets/push/id_ed25519 \
+  -o UserKnownHostsFile=/opt/family-agent/secrets/push/known_hosts \
+  -o StrictHostKeyChecking=yes"
+docker ps -q --filter label=family-agent-exec | xargs -r docker rm -f
+```
+
+`core.sshCommand` makes every fetch and push from this clone use the deploy
+key (the CI deploy's `git fetch` runs as root here). The push container
+overrides it with its own `GIT_SSH_COMMAND` environment variable, so both
+paths work. No gateway restart is needed; exec containers respawn on demand.
+
+### Wiring step 3 — Actions secrets (run on your machine)
+
+```bash
+ssh-keygen -t ed25519 -N '' -f fa-ci-deploy -C family-agent-ci
+ssh-copy-id -i fa-ci-deploy.pub root@128.140.54.129
+ssh-keyscan -t ed25519 128.140.54.129 > fa-box-known-hosts
+gh secret set DEPLOY_SSH_KEY --repo mshron/family-agent < fa-ci-deploy
+gh secret set DEPLOY_KNOWN_HOSTS --repo mshron/family-agent < fa-box-known-hosts
+gh secret set DEPLOY_HOST --repo mshron/family-agent --body 128.140.54.129
+rm fa-ci-deploy fa-ci-deploy.pub fa-box-known-hosts
+```
+
+(Or paste the same three values in repo → Settings → Secrets and variables →
+Actions.)
+
+### Semantics to know
+
+- Every deploy resets the meta clone to `origin/main`. Work that is
+  committed but not pushed is discarded by the next deploy; uncommitted
+  work is lost. Commit, then `push_changes`.
+- Every deploy restarts the gateway. In-flight runs complete in the durable
+  store but their replies may not post; ask the user to resend if one is
+  missing.
+- `DEPLOY_SSH_KEY` grants root ssh to the box, and anyone who can edit the
+  workflow can read it out. Protect `main` (Settings → Branches → branch
+  protection) so only you can push to it.
+
+### Verify
+
+Push any commit to `main` and watch it land
+(`gh run watch` or Actions → deploy), then on the box:
+`docker logs fa-gateway` and `git -C /opt/family-agent/workspaces/meta log -1`.
 
 ## Known limitations (accepted for the feel test)
 

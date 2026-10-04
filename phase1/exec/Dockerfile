@@ -4,7 +4,7 @@
 FROM node:22-slim
 
 RUN apt-get update \
- && apt-get install -y --no-install-recommends git ripgrep ca-certificates \
+ && apt-get install -y --no-install-recommends git ripgrep ca-certificates openssh-client \
  && rm -rf /var/lib/apt/lists/*
 
 RUN git config --global user.name "pi (family-agent)" \
