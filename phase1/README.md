@@ -175,6 +175,33 @@ rm fa-ci-deploy fa-ci-deploy.pub fa-box-known-hosts
 (Or paste the same three values in repo → Settings → Secrets and variables →
 Actions.)
 
+### Adding a channel
+
+Verified end-to-end; every step except the first is automatic:
+
+1. Add the stream name to `streams` in `phase1/channels.json` (edit locally,
+   or ask an agent in #meta — the file is in its workspace). Optionally add a
+   `channels.<name>` block: `add` appends tools to the standard set (this is
+   where #fitness will later add Garmin tools), `tools` replaces the set,
+   `push: true` enables `push_changes` (only #meta has it).
+2. Push to `main` (from the Mac, or `push_changes` from #meta).
+3. The deploy initializes the channel's workspace (skeleton + git) and skills
+   dir, then restarts the gateway.
+4. The gateway subscribes itself to the stream. If the stream does not exist
+   in Zulip, it is **created private**, and the addresses in
+   `ZULIP_OWNER_EMAILS` (in `.env`; defaults from `push-secrets.sh`) are
+   added to it. If it exists, nothing about it changes.
+5. Message it. (Auto-naming, spoilers, reactions, and uploads all work from
+   the first message.)
+
+Quick way without a deploy: edit `/opt/family-agent/phase1/channels.json` on
+the box and run `bash phase1/deploy/install.sh`. The next deploy overwrites
+the box copy, so mirror the change into the repo.
+
+What is deliberately **not** automatic: discovering new streams by itself.
+Zulip's message queues deliver no "stream created" event, and each channel
+needs its tool set chosen anyway — `channels.json` is the gate by design.
+
 ### Semantics to know
 
 - Every deploy resets the meta clone to `origin/main`. Work that is

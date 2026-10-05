@@ -16,6 +16,10 @@ REMOTE_HOST=root@128.140.54.129
 REMOTE_DIR=/opt/family-agent
 PENV="$HOME/Documents/Research/polynumeral-assistant/.env"
 
+# Your Zulip email(s), comma-separated: the bot adds you to streams it
+# creates and to any configured stream you are missing.
+OWNER_EMAILS="user1031086@polynumeral.zulipchat.com"
+
 # Optional: paste the Kagi API key here to switch without 1Password.
 KAGI_MANUAL=""
 
@@ -76,12 +80,10 @@ ZULIP_SITE=$ZULIP_SITE
 ZULIP_EMAIL=$ZULIP_EMAIL
 ZULIP_API_KEY=$ZULIP_API_KEY
 
-# Add your own Zulip email(s), comma-separated, so the bot can add you to
-# the scratch stream on startup. Empty = subscribe manually in Zulip.
-ZULIP_OWNER_EMAILS=
+# Users the bot adds to streams it joins or creates (comma-separated).
+ZULIP_OWNER_EMAILS=$OWNER_EMAILS
 
 # Gateway config
-SCRATCH_STREAM=scratch
 EXEC_IMAGE=family-agent-exec:latest
 WORKSPACES_DIR=/opt/family-agent/workspaces
 DURABLE_DIR=/opt/family-agent/durable

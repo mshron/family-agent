@@ -40,9 +40,16 @@ export class Zulip {
     return this._call("GET", "users/me");
   }
 
+  /**
+   * Subscribe the bot to a stream. A stream name that does not exist yet is
+   * auto-created; the top-level invite_only makes that stream private.
+   * For an existing stream the parameter is ignored (verified against the
+   * API), so it is safe to always pass it.
+   */
   subscribeSelf(streamName, description) {
     return this._call("POST", "users/me/subscriptions", {
       subscriptions: [{ name: streamName, description: description || "" }],
+      invite_only: "true",
     });
   }
 

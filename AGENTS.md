@@ -42,6 +42,20 @@ Consequences:
   (conversation store), `skills/`. Do not try to edit those from here;
   they are outside your mount.
 
+## Adding a channel
+
+When the user asks for a new channel (a #fitness one is planned):
+
+1. Add the stream name to `streams` in `phase1/channels.json`, and a
+   `channels.<name>` block if it needs tools beyond the standard set
+   (that is where #fitness will get Garmin tools once they are built).
+2. Commit, then call `push_changes`. The deploy creates the Zulip stream if
+   it is missing (private), the workspace, and the skills directory; the
+   gateway starts watching it.
+
+Do not remove or rename channels other channels depend on, and do not
+touch the `meta` or `dm` entries.
+
 ## Rules
 
 - No secrets in commits. Keys live on the box, outside this repo.
