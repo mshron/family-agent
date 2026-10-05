@@ -53,6 +53,7 @@ export class Zulip {
     });
   }
 
+  /** Add other users to a stream. Zulip reports per-email results, not a list. */
   async subscribeOthers(streamName, emails) {
     if (!emails || emails.length === 0) return { added: [] };
     try {
@@ -60,7 +61,11 @@ export class Zulip {
         subscriptions: [{ name: streamName }],
         principals: emails,
       });
-      return { added: out.added || [] };
+      return {
+        added: Object.keys(out.subscribed || {}),
+        already: Object.keys(out.already_subscribed || {}),
+        msg: out.msg || "",
+      };
     } catch (err) {
       return { added: [], msg: err.message };
     }

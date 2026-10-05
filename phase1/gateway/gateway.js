@@ -844,6 +844,7 @@ async function ensureStreamAccess() {
     if (env.ZULIP_OWNER_EMAILS.length > 0) {
       const out = await zulip.subscribeOthers(stream, env.ZULIP_OWNER_EMAILS);
       if (out.added.length > 0) log.info(`added to stream ${stream}: ${out.added.join(", ")}`);
+      else if (out.msg) log.warn(`could not add owners to ${stream}: ${out.msg}`);
     }
   }
 }

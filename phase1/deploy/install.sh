@@ -52,5 +52,8 @@ docker build -q -t family-agent-exec:latest phase1/exec
 
 echo "starting gateway..."
 docker compose -f phase1/deploy/docker-compose.yml up -d --build
+# up -d alone does not restart a container whose image is unchanged (for
+# example when only channels.json changed); the config is read at boot.
+docker compose -f phase1/deploy/docker-compose.yml restart gateway
 docker image prune -f >/dev/null
 echo "done. logs: docker logs -f fa-gateway"
