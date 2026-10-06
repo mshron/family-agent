@@ -11,6 +11,7 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       - /opt/family-agent/workspaces:/opt/family-agent/workspaces
       - /opt/family-agent/durable:/opt/family-agent/durable
-      - /opt/family-agent/skills:/opt/family-agent/skills:ro
+      - /opt/family-agent/skills:/opt/family-agent/skills
       - /opt/family-agent/secrets:/opt/family-agent/secrets:ro
       - ../channels.json:/app/channels.json:ro
+      - ../workspace:/app/workspace-skeleton:ro

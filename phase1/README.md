@@ -175,32 +175,36 @@ rm fa-ci-deploy fa-ci-deploy.pub fa-box-known-hosts
 (Or paste the same three values in repo → Settings → Secrets and variables →
 Actions.)
 
-### Adding a channel
+### Adding a channel (membership-driven)
 
-Verified end-to-end; every step except the first is automatic:
+Since the membership rewrite, Zulip itself is the source of truth for which
+streams the gateway watches. To add a channel from the Zulip app:
 
-1. Add the stream name to `streams` in `phase1/channels.json` (edit locally,
-   or ask an agent in #meta — the file is in its workspace). Optionally add a
-   `channels.<name>` block: `add` appends tools to the standard set (this is
-   where #fitness will later add Garmin tools), `tools` replaces the set,
-   `push: true` enables `push_changes` (only #meta has it).
-2. Push to `main` (from the Mac, or `push_changes` from #meta).
-3. The deploy initializes the channel's workspace (skeleton + git) and skills
-   dir, then restarts the gateway.
-4. The gateway subscribes itself to the stream. If the stream does not exist
-   in Zulip, it is **created private**, and the addresses in
-   `ZULIP_OWNER_EMAILS` (in `.env`; defaults from `push-secrets.sh`) are
-   added to it. If it exists, nothing about it changes.
-5. Message it. (Auto-naming, spoilers, reactions, and uploads all work from
-   the first message.)
+1. Create the stream and invite the bot (add an owner to the stream too —
+   see the invite gate below).
+2. The gateway's control queue receives the `subscription` add event, runs
+   the invite gate (an owner must be a subscriber; if `ZULIP_OWNER_EMAILS`
+   is configured and none is present, the invite is declined and the bot
+   leaves), provisions the workspace (copy of `phase1/workspace/`, git
+   initialized) and an empty `skills/<stream>/` dir, starts a poller, and
+   posts a greeting in a `family-agent` topic. No deploy involved.
+3. If the channel needs tools beyond the standard set, add a
+   `channels.<name>` block to `phase1/channels.json` in a normal commit
+   (`add` appends tools, `tools` replaces the set, `push: true` enables
+   `push_changes`). Watching the stream needs no deploy; new tool sets
+   apply to new conversations.
 
-Quick way without a deploy: edit `/opt/family-agent/phase1/channels.json` on
-the box and run `bash phase1/deploy/install.sh`. The next deploy overwrites
-the box copy, so mirror the change into the repo.
+Seed streams (`streams` in `channels.json`, currently `scratch` and
+`meta`) are still self-subscribed at boot, and the bot also adds the
+configured owners to them. Removing the bot from any stream stops its
+poller for that channel.
 
-What is deliberately **not** automatic: discovering new streams by itself.
-Zulip's message queues deliver no "stream created" event, and each channel
-needs its tool set chosen anyway — `channels.json` is the gate by design.
+The old channels.json-driven flow (add stream to the file, deploy, bot
+creates it if missing) still works for seeds.
+
+What is still not automatic: tool-set selection for new channels
+(deliberately — granting bash/push is a choice), and any ability to grant
+itself access to streams nobody invited it to.
 
 ### Semantics to know
 

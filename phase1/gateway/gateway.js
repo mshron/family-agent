@@ -31,6 +31,7 @@ import {
   workspaceDir,
 } from "./lib/sections.js";
 import { loadChannelConfig } from "./lib/channels.js";
+import { provisionStream } from "./lib/provision.js";
 import { buildZulipTools } from "./lib/tools.js";
 import { GENERAL_CHAT, nameTopic } from "./lib/naming.js";
 
@@ -72,6 +73,7 @@ const env = {
   SKILLS_DIR: process.env.SKILLS_DIR || "/opt/family-agent/skills",
   SECRETS_DIR: process.env.SECRETS_DIR || "/opt/family-agent/secrets",
   CHANNELS_FILE: process.env.CHANNELS_FILE || "/app/channels.json",
+  WORKSPACE_SKELETON_DIR: process.env.WORKSPACE_SKELETON_DIR || "/app/workspace-skeleton",
   OPENROUTER_API_KEY: requireEnv("OPENROUTER_API_KEY"),
   IDLE_MINUTES: Number(process.env.IDLE_MINUTES) || IDLE_MINUTES,
   ZULIP_OWNER_EMAILS: (process.env.ZULIP_OWNER_EMAILS || "")
@@ -828,7 +830,49 @@ async function onMessage(message) {
   return onStreamMessage(message);
 }
 
+// Owner user ids, resolved once at boot; empty when none could be resolved.
+const ownerUserIds = new Set();
+
+async function resolveOwners() {
+  for (const email of env.ZULIP_OWNER_EMAILS) {
+    try {
+      const user = await zulip.getUserByEmail(email);
+      ownerUserIds.add(user.user_id);
+    } catch (err) {
+      log.warn(`could not resolve owner ${email}: ${err.message}`);
+    }
+  }
+  if (ownerUserIds.size > 0) {
+    log.info(`owner gate active: ${[...ownerUserIds].join(", ")}`);
+  } else if (env.ZULIP_OWNER_EMAILS.length > 0) {
+    log.warn("no owner ids resolved; the invite gate cannot verify anyone");
+  }
+}
+
+/**
+ * The invite gate: a stream is auto-joined only if an owner is subscribed
+ * to it. If no owners are configured the gate is open (private realms);
+ * if owners are configured but none could be resolved it is shut.
+ */
+async function ownersPresent(streamId) {
+  if (env.ZULIP_OWNER_EMAILS.length === 0) return true;
+  if (ownerUserIds.size === 0) return false;
+  try {
+    const body = await zulip.getStreamMembers(streamId);
+    const ids = body.subscribers ?? [];
+    for (const id of ownerUserIds) {
+      if (ids.includes(id)) return true;
+    }
+    return false;
+  } catch (err) {
+    log.warn(`subscriber check failed for stream ${streamId}: ${err.message}`);
+    return false;
+  }
+}
+
 async function ensureStreamAccess() {
+  // Seed streams from channels.json: the bot self-subscribes and adds the
+  // owners. Every other channel is joined by invitation only.
   for (const stream of channelConfig.streams) {
     try {
       await zulip.subscribeSelf(
@@ -849,13 +893,73 @@ async function ensureStreamAccess() {
   }
 }
 
+/** Boot-time membership discovery: watch every stream the bot is in. */
+async function discoverStreams() {
+  let body;
+  try {
+    body = await zulip.getOwnSubscriptions();
+  } catch (err) {
+    log.warn(`subscription discovery failed: ${err.message}`);
+    return;
+  }
+  for (const sub of body.subscriptions ?? []) {
+    const stream = sub.name;
+    if (streamQueues.has(stream)) continue;
+    if (channelConfig.streams.includes(stream)) {
+      startStreamQueue(stream);
+      continue;
+    }
+    if (!(await ownersPresent(sub.stream_id))) {
+      log.warn(`"${stream}": subscribed but no owner is present; leaving`);
+      await zulip.unsubscribe(stream).catch(() => {});
+      continue;
+    }
+    await provisionStream(env, stream, log);
+    startStreamQueue(stream);
+    log.info(`watching discovered channel "${stream}"`);
+  }
+}
+
+/** A subscription event: an invite (op add) or a removal (op remove). */
+async function handleSubscriptionEvent(event) {
+  if (event.op === "add") {
+    for (const sub of event.subscriptions ?? []) {
+      const stream = sub.name;
+      if (streamQueues.has(stream) || channelConfig.streams.includes(stream)) continue;
+      if (!(await ownersPresent(sub.stream_id))) {
+        log.warn(`invite to "${stream}" declined: no owner is a subscriber`);
+        await zulip.unsubscribe(stream).catch(() => {});
+        continue;
+      }
+      await provisionStream(env, stream, log);
+      startStreamQueue(stream);
+      zulip
+        .sendStreamMessage(
+          stream,
+          "family-agent",
+          "👋 Joined this channel by invitation. A fresh workspace was provisioned for it — say hi and I'll get to work."
+        )
+        .catch((err) => log.warn(`join announce failed for ${stream}: ${err.message}`));
+      log.info(`joined new channel "${stream}" by invitation`);
+    }
+  } else if (event.op === "remove") {
+    for (const sub of event.subscriptions ?? []) {
+      if (channelConfig.streams.includes(sub.name)) continue;
+      stopStreamQueue(sub.name);
+      log.info(`left channel "${sub.name}"; poller stopped`);
+    }
+  }
+}
+
 /**
- * One independent poller per stream queue plus one for direct messages.
- * Each queue polls in its own loop, and message handling is fire-and-forget:
- * a long conversation run never delays event pickup for any queue.
+ * One independent poller per stream queue plus one for direct messages and
+ * one control queue (subscription events). Each queue polls in its own
+ * loop, and message handling is fire-and-forget: a long conversation run
+ * never delays event pickup for any queue.
  */
 async function pollQueueForever(q) {
   for (;;) {
+    if (q.stopped) return;
     try {
       if (!q.queueId) {
         const reg =
@@ -884,15 +988,53 @@ async function pollQueueForever(q) {
   }
 }
 
+/** stream name -> poller state; membership drives this map. */
+const streamQueues = new Map();
+
+function startStreamQueue(stream) {
+  if (streamQueues.has(stream)) return;
+  const q = { kind: "stream", stream, queueId: null, lastEventId: -1 };
+  streamQueues.set(stream, q);
+  void pollQueueForever(q);
+}
+
+function stopStreamQueue(stream) {
+  const q = streamQueues.get(stream);
+  if (!q) return;
+  q.stopped = true;
+  streamQueues.delete(stream);
+}
+
+/** Control queue: invites and removals, no messages. */
+async function pollControlQueue() {
+  const q = { queueId: null, lastEventId: -1 };
+  for (;;) {
+    try {
+      if (!q.queueId) {
+        const reg = await zulip.registerControlQueue();
+        q.queueId = reg.queue_id;
+        q.lastEventId = reg.last_event_id;
+        log.info(`control queue registered: ${q.queueId.slice(0, 8)}`);
+      }
+      const { events, lastEventId: newest } = await zulip.getEvents(q.queueId, q.lastEventId);
+      q.lastEventId = newest;
+      for (const event of events) {
+        if (event.type !== "subscription") continue;
+        await handleSubscriptionEvent(event).catch((err) =>
+          log.error(`subscription event handling failed: ${err.message}`)
+        );
+      }
+    } catch (err) {
+      log.warn(`control poll failed: ${err.message}; re-registering`);
+      q.queueId = null;
+      await new Promise((r) => setTimeout(r, 3000));
+    }
+  }
+}
+
 function pollLoop() {
-  const queues = channelConfig.streams.map((stream) => ({
-    kind: "stream",
-    stream,
-    queueId: null,
-    lastEventId: -1,
-  }));
-  queues.push({ kind: "private", queueId: null, lastEventId: -1 });
-  for (const q of queues) void pollQueueForever(q);
+  const q = { kind: "private", queueId: null, lastEventId: -1 };
+  void pollQueueForever(q);
   return new Promise(() => {}); // runs forever
 }
 
@@ -939,6 +1081,9 @@ async function main() {
     await mkdir(path.join(env.WORKSPACES_DIR, dir), { recursive: true });
   }
   await ensureStreamAccess();
+  await resolveOwners();
+  await discoverStreams();
+  void pollControlQueue();
 
   const shutdown = async (sig) => {
     log.info(`${sig} received; shutting down`);

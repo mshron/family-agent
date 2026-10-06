@@ -44,14 +44,26 @@ Consequences:
 
 ## Adding a channel
 
-When the user asks for a new channel (a #fitness one is planned):
+Channels are now membership-driven: Zulip itself is the source of truth
+for which streams the gateway watches. `channels.json` keeps only the
+*seed* streams (self-subscribed at boot; currently `scratch` and `meta`)
+and per-channel tool overrides.
 
-1. Add the stream name to `streams` in `phase1/channels.json`, and a
-   `channels.<name>` block if it needs tools beyond the standard set
-   (that is where #fitness will get Garmin tools once they are built).
-2. Commit, then call `push_changes`. The deploy creates the Zulip stream if
-   it is missing (private), the workspace, and the skills directory; the
-   gateway starts watching it.
+To add a channel from the Zulip app:
+
+1. Create a stream and invite the bot. The gateway's control queue picks
+   up the `subscription` add event. If no configured owner is a member of
+   the stream, the invite is declined and the bot leaves.
+2. On acceptance the gateway provisions the workspace (from the
+   `phase1/workspace/` skeleton) and skills directory at runtime, starts a
+   poller, and posts a greeting in a `family-agent` topic.
+
+If a channel needs tools beyond the standard set, add a
+`channels.<name>` block to `phase1/channels.json` in a normal commit
+(that is where #fitness will get Garmin tools once they are built). No
+deploy is needed just to watch a new stream.
+
+Removing the bot from a stream stops its poller for that channel.
 
 Do not remove or rename channels other channels depend on, and do not
 touch the `meta` or `dm` entries.

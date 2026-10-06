@@ -71,18 +71,49 @@ export class Zulip {
     }
   }
 
-  /** One event queue. apply_markdown=false: events carry raw markdown. */
-  register(narrow) {
+  /**
+   * One event queue. apply_markdown=false: message events carry raw
+   * markdown. `eventTypes` defaults to messages only; the control queue
+   * also listens for "subscription" (invite/leave) events.
+   */
+  register(narrow, eventTypes = ["message"]) {
     return this._call("POST", "register", {
-      event_types: ["message"],
+      event_types: JSON.stringify(eventTypes),
       apply_markdown: "false",
       narrow,
       client: "family-agent-gateway",
     });
   }
 
+  /** The bot's own stream subscriptions: membership is the channel list. */
+  getOwnSubscriptions() {
+    return this._call("GET", "users/me/subscriptions");
+  }
+
+  /** Leave a stream (accepting an invite is just subscribeSelf). */
+  unsubscribe(streamName) {
+    return this._call("DELETE", "users/me/subscriptions", {
+      subscriptions: JSON.stringify([streamName]),
+    });
+  }
+
+  /** Subscriber user ids of one stream (the bot must be a member). */
+  getStreamMembers(streamId) {
+    return this._call("GET", `streams/${streamId}/members`);
+  }
+
+  /** One user by email, for resolving owner emails to ids. */
+  getUserByEmail(email) {
+    return this._call("GET", `users/${encodeURIComponent(email)}`);
+  }
+
   registerStreamQueue(streamName) {
     return this.register([["stream", streamName]]);
+  }
+
+  /** No narrow: all subscription add/remove events for the bot itself. */
+  registerControlQueue() {
+    return this.register([], ["subscription"]);
   }
 
   registerPrivateQueue() {
