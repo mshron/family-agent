@@ -43,8 +43,10 @@ The Zulip bot is the existing "Nanobot" bot user, on the private stream
 - **`history_search`.** Channel-scoped search over past conversations
   (all topics, including pre-`/new` ones), with topic names in results.
 - **Direct messages.** A DM to the bot is one continuous conversation per
-  DM group (workspace: `dm`). Spoilers, reactions, commands, and uploads
-  work there; spawn/fork do not (DMs have no topics).
+  DM group, and each group gets its own workspace (`workspaces/dm-<user
+  ids>`) — memory and notes from one person's DM never surface in another
+  person's. Spoilers, reactions, commands, and uploads work there;
+  spawn/fork do not (DMs have no topics).
 - **Channels.** Membership-driven: any member of the Zulip organization can
   invite the bot to a stream; the bot joins, provisions the channel's
   workspace, and starts watching. `phase1/channels.json` holds only seed

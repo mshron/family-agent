@@ -19,10 +19,11 @@ fi
 CHANNELS_FILE="phase1/channels.json"
 mapfile -t STREAMS < <(jq -r '.streams[]' "$CHANNELS_FILE")
 
-# One workspace repo per channel (once), plus "dm" for direct messages.
+# One workspace repo per channel (once). DM workspaces provision at runtime,
+# one per DM group, like invited channels.
 # meta is special: its workspace is a clone of the system repo, not the
 # skeleton (see the README before wiring it up).
-for s in "${STREAMS[@]}" dm; do
+for s in "${STREAMS[@]}"; do
   if [ "$s" = "meta" ] && [ -n "${META_REMOTE_URL:-}" ] && [ ! -d "workspaces/meta/.git" ]; then
     git clone "$META_REMOTE_URL" workspaces/meta
     echo "meta workspace cloned from $META_REMOTE_URL"
@@ -42,7 +43,7 @@ mkdir -p durable
 
 # Skill layers: read-only for agents, one dir per layer.
 mkdir -p skills/global
-for s in "${STREAMS[@]}" dm; do mkdir -p "skills/$s"; done
+for s in "${STREAMS[@]}"; do mkdir -p "skills/$s"; done
 
 # Push secrets for the meta channel (deploy key + known_hosts), mode 600.
 mkdir -p secrets/push

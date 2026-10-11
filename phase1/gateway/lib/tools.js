@@ -231,7 +231,7 @@ export function buildZulipTools({ onThreadCreated, onPushChanges }) {
       if (!mine?.stream) {
         return { content: [{ type: "text", text: "No channel mapping for this conversation." }] };
       }
-      if (mine.stream === "dm") {
+      if (mine.recipients) {
         return { content: [{ type: "text", text: "spawn_thread is not available in direct messages (there are no topics to spawn)." }] };
       }
       let childId = await api.memo(`spawn:${args.topic}`, context);
@@ -274,7 +274,7 @@ export function buildZulipTools({ onThreadCreated, onPushChanges }) {
       if (!mine?.stream) {
         return { content: [{ type: "text", text: "No channel mapping for this conversation." }] };
       }
-      if (mine.stream === "dm") {
+      if (mine.recipients) {
         return { content: [{ type: "text", text: "fork_thread is not available in direct messages (there are no topics to fork into)." }] };
       }
       let forkId = await api.memo(`fork:${args.topic}`, context);

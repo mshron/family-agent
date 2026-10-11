@@ -250,10 +250,10 @@ function dmRoute(message) {
   const emails = recipients.map((r) => r.email);
   return {
     kind: "dm",
-    stream: "dm",
+    stream: groupKey, // workspace and channel key: one per DM group
     topic: groupKey,
     conversationKey: `dm::${groupKey}`,
-    channel: "dm",
+    channel: groupKey,
     replyRecipients: emails,
     reply: (content) => zulip.sendPrivateMessage(emails, content),
   };
@@ -271,7 +271,7 @@ function registerConversation(conversationId, mapping) {
   byId.set(conversationId, mapping);
   if (existing?.topic !== mapping.topic) {
     byTopic.set(
-      mapping.stream === "dm"
+      mapping.recipients
         ? `dm::${mapping.topic}`
         : `${mapping.stream}::${mapping.topic}`,
       conversationId
@@ -287,8 +287,19 @@ async function bootScan() {
       context
     );
     for (const record of page.items) {
-      const doc = await harness.snapshot(ZulipDoc, record.id, context);
+      let doc = await harness.snapshot(ZulipDoc, record.id, context);
       if (doc?.stream && doc?.topic) {
+        if (doc.stream === "dm" && String(doc.topic).startsWith("dm-")) {
+          // Migration: DM workspaces used to be one shared "dm" directory;
+          // they are per group now, and the group key was the old topic.
+          const group = doc.topic;
+          await harness.commit(async (tx) => {
+            const d = await tx.doc(ZulipDoc, record.id);
+            d.stream = group;
+          }, context);
+          doc = { ...doc, stream: group };
+          log.info(`migrated DM conversation ${record.id} to workspace ${group}`);
+        }
         registerConversation(record.id, {
           stream: doc.stream,
           topic: doc.topic,
@@ -329,7 +340,7 @@ async function ensureConversation(route) {
   }
   const docInit =
     route.kind === "dm"
-      ? { stream: "dm", topic: route.topic, recipients: route.replyRecipients }
+      ? { stream: route.channel, topic: route.topic, recipients: route.replyRecipients }
       : { stream: route.stream, topic: route.topic };
   const tools = channelConfig
     .toolsFor(route.channel)
@@ -814,6 +825,8 @@ async function onDmMessage(message) {
     log.info(
       `direct message from ${message.sender_full_name} (${route.conversationKey}): ${content.slice(0, 100)}`
     );
+    // One workspace per DM group, provisioned on first contact.
+    await provisionStream(env, route.channel, log);
     if (content.startsWith("/")) {
       const handled = await handleCommand(route, content);
       if (handled) return;
@@ -1032,7 +1045,7 @@ async function main() {
   const me = await zulip.getMe();
   botUserId = me.user_id;
   log.info(`gateway bot: ${me.full_name} <${me.email}> (user_id ${botUserId})`);
-  for (const dir of [...channelConfig.streams, "dm"]) {
+  for (const dir of channelConfig.streams) {
     await mkdir(path.join(env.WORKSPACES_DIR, dir), { recursive: true });
   }
   await ensureStreamAccess();

@@ -32,7 +32,7 @@ export class ChannelConfig {
   }
 
   /**
-   * The tool name list for one channel key (a stream name, or "dm" for
+   * The tool name list for one channel key (a stream name, or a "dm-<ids>"
    * direct messages). `tools` replaces the standard set; `add` appends.
    */
   toolsFor(channel) {

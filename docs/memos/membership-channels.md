@@ -31,6 +31,16 @@ Everything else is joined by invitation:
 5. Removal from a stream stops that poller. Boot-time discovery
    (`GET /users/me/subscriptions`) reapplies all of this after restarts.
 
+**Direct-message workspaces (2026-10-12, Max's decision):** DMs are
+multi-user now that invitations are open. Each DM group keys its own
+workspace and channel (`dm-<sorted other user ids>`), provisioned at
+runtime like invited channels; `history_search` and memory therefore stay
+per group, and one person's DM memory never leaks into another's.
+Conversations created before this change are migrated at boot: their
+doc's `stream` field is rewritten from `dm` to the group key (the old
+shared `workspaces/dm` directory is copied per group on the box, then
+removed).
+
 ## Why this shape
 
 - Creating a channel is a Zulip-app action; no deploy, no config edit.
