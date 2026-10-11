@@ -97,19 +97,6 @@ export class Zulip {
     });
   }
 
-  /** Subscriber user ids of one stream (the bot must be a member). */
-  getStreamMembers(streamId) {
-    return this._call("GET", `streams/${streamId}/members`);
-  }
-
-  /** One user by email, for resolving owner emails to ids. */
-  /** The user object (id, name, role), not the response body that wraps it. */
-  async getUserByEmail(email) {
-    const body = await this._call("GET", `users/${encodeURIComponent(email)}`);
-    if (!body.user) throw new Error(`no user object for ${email}`);
-    return body.user;
-  }
-
   registerStreamQueue(streamName) {
     return this.register([["stream", streamName]]);
   }

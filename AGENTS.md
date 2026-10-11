@@ -52,9 +52,9 @@ and per-channel tool overrides.
 To add a channel from the Zulip app:
 
 1. Create a stream and invite the bot. The gateway's control queue picks
-   up the `subscription` add event. If no configured owner is a member of
-   the stream, the invite is declined and the bot leaves.
-2. On acceptance the gateway provisions the workspace (from the
+   up the `subscription` add event. Invitations are open: any member of
+   the organization can add the bot, and the bot always joins.
+2. On joining, the gateway provisions the workspace (from the
    `phase1/workspace/` skeleton) and skills directory at runtime, starts a
    poller, and posts a greeting in a `family-agent` topic.
 

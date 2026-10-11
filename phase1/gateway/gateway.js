@@ -830,45 +830,10 @@ async function onMessage(message) {
   return onStreamMessage(message);
 }
 
-// Owner user ids, resolved once at boot; empty when none could be resolved.
-const ownerUserIds = new Set();
-
-async function resolveOwners() {
-  for (const email of env.ZULIP_OWNER_EMAILS) {
-    try {
-      const user = await zulip.getUserByEmail(email);
-      ownerUserIds.add(user.user_id);
-    } catch (err) {
-      log.warn(`could not resolve owner ${email}: ${err.message}`);
-    }
-  }
-  if (ownerUserIds.size > 0) {
-    log.info(`owner gate active: ${[...ownerUserIds].join(", ")}`);
-  } else if (env.ZULIP_OWNER_EMAILS.length > 0) {
-    log.warn("no owner ids resolved; the invite gate cannot verify anyone");
-  }
-}
-
-/**
- * The invite gate: a stream is auto-joined only if an owner is subscribed
- * to it. If no owners are configured the gate is open (private realms);
- * if owners are configured but none could be resolved it is shut.
- */
-async function ownersPresent(streamId) {
-  if (env.ZULIP_OWNER_EMAILS.length === 0) return true;
-  if (ownerUserIds.size === 0) return false;
-  try {
-    const body = await zulip.getStreamMembers(streamId);
-    const ids = body.subscribers ?? [];
-    for (const id of ownerUserIds) {
-      if (ids.includes(id)) return true;
-    }
-    return false;
-  } catch (err) {
-    log.warn(`subscriber check failed for stream ${streamId}: ${err.message}`);
-    return false;
-  }
-}
+// Invitations are open: any member of the Zulip organization can add the
+// bot to a channel, and the bot joins, provisions a workspace, and starts
+// watching. (Until 2026-10-12 an owner gate checked that the configured
+// owner was a subscriber; removed so other people can use the system.)
 
 async function ensureStreamAccess() {
   // Seed streams from channels.json: the bot self-subscribes and adds the
@@ -909,11 +874,6 @@ async function discoverStreams() {
       startStreamQueue(stream);
       continue;
     }
-    if (!(await ownersPresent(sub.stream_id))) {
-      log.warn(`"${stream}": subscribed but no owner is present; leaving`);
-      await zulip.unsubscribe(stream).catch(() => {});
-      continue;
-    }
     await provisionStream(env, stream, log);
     startStreamQueue(stream);
     log.info(`watching discovered channel "${stream}"`);
@@ -926,11 +886,6 @@ async function handleSubscriptionEvent(event) {
     for (const sub of event.subscriptions ?? []) {
       const stream = sub.name;
       if (streamQueues.has(stream) || channelConfig.streams.includes(stream)) continue;
-      if (!(await ownersPresent(sub.stream_id))) {
-        log.warn(`invite to "${stream}" declined: no owner is a subscriber`);
-        await zulip.unsubscribe(stream).catch(() => {});
-        continue;
-      }
       await provisionStream(env, stream, log);
       startStreamQueue(stream);
       zulip
@@ -1081,7 +1036,6 @@ async function main() {
     await mkdir(path.join(env.WORKSPACES_DIR, dir), { recursive: true });
   }
   await ensureStreamAccess();
-  await resolveOwners();
   await discoverStreams();
   void pollControlQueue();
 

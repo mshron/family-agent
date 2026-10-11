@@ -45,9 +45,12 @@ The Zulip bot is the existing "Nanobot" bot user, on the private stream
 - **Direct messages.** A DM to the bot is one continuous conversation per
   DM group (workspace: `dm`). Spoilers, reactions, commands, and uploads
   work there; spawn/fork do not (DMs have no topics).
-- **Channels.** `phase1/channels.json` lists the streams the gateway ingests
-  and the tool set each channel gets (`tools` replaces, `add` appends to the
-  standard set). Changing it needs a gateway restart, not a rebuild.
+- **Channels.** Membership-driven: any member of the Zulip organization can
+  invite the bot to a stream; the bot joins, provisions the channel's
+  workspace, and starts watching. `phase1/channels.json` holds only seed
+  streams (auto-subscribed at boot) and per-channel tool overrides
+  (`tools` replaces, `add` appends to the standard set). Removing the bot
+  from a stream stops that channel's poller.
 - **Skills.** Two read-only layers mounted into every exec container:
   `/skills` (global) and `/channel-skills` (this channel). Install with
   `phase1/skills/install.sh <git-url-or-path> [--global | --channel NAME]`.

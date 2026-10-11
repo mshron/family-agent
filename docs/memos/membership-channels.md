@@ -16,12 +16,14 @@ Everything else is joined by invitation:
 1. A user creates a stream in the Zulip app and invites the bot.
 2. The bot's control queue (event types `["subscription"]`, no narrow)
    receives the `subscription`/`add` event.
-3. The **invite gate** runs: if `ZULIP_OWNER_EMAILS` is configured, at
-   least one owner user id must be a subscriber of the stream (checked
-   against `GET /streams/{id}/members`, not the event payload, which does
-   not reliably identify the inviter). Fail-open when no owners are
-   configured; fail-closed when owners are configured but none resolve at
-   boot. Rejected invites: the bot unsubscribes.
+3. ~~The **invite gate**: if `ZULIP_OWNER_EMAILS` is configured, at least
+   one owner user id must be a subscriber of the stream.~~ **Removed
+   2026-10-12 (Max's decision):** the system is becoming multi-user, and any
+   member of the organization may invite the bot. Every invitation is
+   accepted. `ZULIP_OWNER_EMAILS` still seeds the owner into the channels in
+   `channels.json`, nothing more. (The gate's first version also had a bug
+   — it read `user_id` off the API response body instead of `body.user` —
+   which declined every invite, including ones it should have accepted.)
 4. On acceptance: workspace copied from `phase1/workspace/` (git
    initialized) via `lib/provision.js`, `skills/<stream>/` created, a
    per-stream poller starts, and a greeting is posted in a
