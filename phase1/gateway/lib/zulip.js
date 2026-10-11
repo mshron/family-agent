@@ -103,8 +103,11 @@ export class Zulip {
   }
 
   /** One user by email, for resolving owner emails to ids. */
-  getUserByEmail(email) {
-    return this._call("GET", `users/${encodeURIComponent(email)}`);
+  /** The user object (id, name, role), not the response body that wraps it. */
+  async getUserByEmail(email) {
+    const body = await this._call("GET", `users/${encodeURIComponent(email)}`);
+    if (!body.user) throw new Error(`no user object for ${email}`);
+    return body.user;
   }
 
   registerStreamQueue(streamName) {
