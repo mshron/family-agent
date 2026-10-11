@@ -206,6 +206,20 @@ What is still not automatic: tool-set selection for new channels
 (deliberately — granting bash/push is a choice), and any ability to grant
 itself access to streams nobody invited it to.
 
+### Dependencies and upgrades
+
+`package.json` pins `chord`, `pi-ai`, and `pi-durable` to exact versions, with
+a committed `package-lock.json`; the image builds with `npm ci`. This is
+load-bearing: an earlier unpinned setup resolved `^1.0.0` at build time, a
+rebuild silently picked up pi-durable 1.0.4, and its stricter `onOutput`
+contract crashed the gateway on every bash call with output. Upgrading is now
+a deliberate act:
+
+1. Bump the pins, regenerate the lockfile, build a test image.
+2. Run the contract check:
+   `docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v <repo>/phase1/gateway/scripts/onoutput-contract.mjs:/app/check.mjs:ro -w /app fa-test node check.mjs`
+3. Deploy, then exercise bash in a channel.
+
 ### Semantics to know
 
 - Every deploy resets the meta clone to `origin/main`. Work that is
