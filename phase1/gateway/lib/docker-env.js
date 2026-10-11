@@ -8,6 +8,7 @@
 
 import { spawn } from "node:child_process";
 import path from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import { ExecutionError, FileError } from "@earendil-works/pi-durable/env";
 
 const ok = (value) => ({ ok: true, value });
@@ -52,6 +53,29 @@ export class DockerExecutionEnv {
       let out = "";
       let errText = "";
       let done = false;
+      // Each stream decodes separately, so a character split across chunks
+      // survives. onOutput gets the stream it came from; a throwing callback
+      // is logged, never propagated: the socket handler cannot crash the
+      // gateway.
+      const decoders = {
+        stdout: new StringDecoder("utf8"),
+        stderr: new StringDecoder("utf8"),
+      };
+      const emit = (buffer, stream) => {
+        const text = decoders[stream].write(buffer);
+        if (!text) return;
+        if (stream === "stdout") out += text;
+        else errText += text;
+        if (!onOutput) return;
+        try {
+          onOutput(text, stream);
+        } catch (cbErr) {
+          console.error(
+            "[docker-env] onOutput callback failed:",
+            cbErr && cbErr.message ? cbErr.message : String(cbErr)
+          );
+        }
+      };
       const finish = (exitCode) => {
         if (done) return;
         done = true;
@@ -64,16 +88,8 @@ export class DockerExecutionEnv {
             finish(-1);
           }, timeoutMs)
         : null;
-      child.stdout.on("data", (chunk) => {
-        const text = chunk.toString("utf8");
-        out += text;
-        onOutput?.(text);
-      });
-      child.stderr.on("data", (chunk) => {
-        const text = chunk.toString("utf8");
-        errText += text;
-        onOutput?.(text); // combined stream, like NodeExecutionEnv
-      });
+      child.stdout.on("data", (buffer) => emit(buffer, "stdout"));
+      child.stderr.on("data", (buffer) => emit(buffer, "stderr"));
       child.on("exit", (code) => finish(code ?? -1));
       child.on("error", (e) => {
         errText += String(e);
@@ -119,7 +135,10 @@ export class DockerExecutionEnv {
     const secs = opts.timeout ? Math.max(1, Math.ceil(opts.timeout / 1000)) : 3600;
     argv.push("timeout", "-k", "1", String(secs), "bash", "-c", command);
     const result = await this._docker(argv, {
-      onOutput: (text) => opts.onOutput?.(text, context),
+      // pi-durable's Shell contract: onOutput(text, context, info) with
+      // info = { stream }. `skipped` is only sent when a window omits output;
+      // we transfer everything, so it stays undefined.
+      onOutput: (text, stream) => opts.onOutput?.(text, context, { stream }),
     });
     if (result.exitCode === -1) {
       return err(
