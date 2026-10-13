@@ -22,6 +22,7 @@ import { contentText } from "@earendil-works/pi-ai";
 
 import { Zulip } from "./lib/zulip.js";
 import { buildModels, MODEL_ALIASES, smallLlm } from "./lib/models.js";
+import { pickThinkingEmoji } from "./lib/emoji.js";
 import { DockerExecutionEnv } from "./lib/docker-env.js";
 import { ZulipDoc, GatewayDoc } from "./lib/docs.js";
 import {
@@ -754,7 +755,10 @@ async function runEditedTurn(conversation, route, { messageId, editTimestamp, co
     context
   );
   if (existing) return;
-  await zulip.addReaction(messageId, "eyes").catch(() => {});
+  const reaction = await pickReaction(content, route, messageId);
+  await zulip
+    .addReaction(messageId, reaction.emoji)
+    .catch(() => zulip.addReaction(messageId, "eyes").catch(() => {}));
   try {
     // Same ordering rule as fresh prompts: the placement must land in the
     // conversation's order gate so a concurrent /stop cannot overtake it.
@@ -782,7 +786,9 @@ async function runEditedTurn(conversation, route, { messageId, editTimestamp, co
         : answer;
     await recordTailPost(conversation.id, await route.reply(reply));
   } finally {
-    await zulip.removeReaction(messageId, "eyes").catch(() => {});
+    await zulip
+      .removeReaction(messageId, reaction.emoji)
+      .catch(() => zulip.removeReaction(messageId, "eyes").catch(() => {}));
   }
 }
 
@@ -1183,6 +1189,7 @@ function inOrder(conversationKey, effect) {
 // covers the durable effect (a command, or placing a prompt); waiting for
 // the run and posting its reply happen after, so the gate stays short.
 async function dispatchConversation(route, content, message) {
+  let thinkingEmoji = "eyes";
   let placed = null;
   try {
     placed = await inOrder(route.conversationKey, async () => {
@@ -1190,14 +1197,18 @@ async function dispatchConversation(route, content, message) {
         const handled = await handleCommand(route, content);
         if (handled) return null;
       }
-      // Thinking indicator: an eyes reaction while the run is live,
+      // Thinking indicator: a Jev-picked emoji while the run is live,
       // removed when the reply posts (streams and DMs both).
-      await zulip.addReaction(message.id, "eyes").catch(() => {});
+      const reaction = await pickReaction(content, route, message.id);
+      await zulip
+        .addReaction(message.id, reaction.emoji)
+        .catch(() => zulip.addReaction(message.id, "eyes").catch(() => {}));
+      thinkingEmoji = reaction.emoji;
       return placePrompt(route, message);
     });
   } catch (err) {
     log.error(`handling ${route.conversationKey} failed: ${err.message}`);
-    await zulip.removeReaction(message.id, "eyes").catch(() => {});
+    await zulip.removeReaction(message.id, thinkingEmoji).catch(() => zulip.removeReaction(message.id, "eyes").catch(() => {}));
     route.reply(`Gateway error: ${err.message}`).catch(() => {});
     return;
   }
@@ -1208,8 +1219,33 @@ async function dispatchConversation(route, content, message) {
     log.error(`settling ${route.conversationKey} failed: ${err.message}`);
     route.reply(`Gateway error: ${err.message}`).catch(() => {});
   } finally {
-    await zulip.removeReaction(message.id, "eyes").catch(() => {});
+    await zulip
+      .removeReaction(message.id, thinkingEmoji)
+      .catch(() => zulip.removeReaction(message.id, "eyes").catch(() => {}));
   }
+}
+
+/** The Jev-picked thinking reaction for one incoming message. Asks the
+ *  Decisions API for a Choice over candidate emoji, fails closed to eyes,
+ *  and audits every decision (including fallbacks) so thresholds can be
+ *  tuned on what actually happened. */
+async function pickReaction(content, route, messageId) {
+  const reaction = await pickThinkingEmoji({
+    apiKey: env.OPENROUTER_API_KEY,
+    content,
+    surface: route.kind === "dm" ? "direct message" : route.conversationKey,
+  });
+  audit.record("jev_emoji", {
+    stream: route.stream ?? route.kind ?? "unknown",
+    messageId,
+    emoji: reaction.emoji,
+    choice: reaction.choice,
+    confidence: reaction.confidence,
+    probabilities: reaction.probabilities,
+    cost: reaction.cost,
+    error: reaction.error,
+  });
+  return reaction;
 }
 
 // ---------------------------------------------------------------------------
