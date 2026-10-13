@@ -61,7 +61,7 @@ const post = (p, body) =>
 (async () => {
   try {
     const res = await post("/_mark/register", { file: hostPath });
-    if (res.code !== 200) {
+    if (res.code < 200 || res.code >= 300) {
       console.error(`mark: registration failed (${res.code}): ${res.body}`);
       process.exit(1);
     }
