@@ -284,6 +284,22 @@ Everything Phase 1 skipped arrives here — against a system you already like us
 
 See open question 3 — docker-zulip on the gateway box is the documented path. Only after the system is stable; not coupled to this migration.
 
+## Running log
+
+**2026-10-12 — mark (markdown preview) on the box, tailnet-only.** The mark
+skill is now available to every agent: `mark <file.md>` registers the doc
+with a preview server installed on the box and prints a tailnet URL, which
+the agent posts into the chat; the reader gets live preview plus
+click-to-comment review (`.comments.md` beside the doc). Networking
+decisions: no public port — the sidecar binds only the box's Tailscale
+address (mark dropped ssh-tunnel support upstream, so the tailnet is the
+supported remote mode), Vivify's wildcard port is firewalled (ufw now on:
+ssh + tailscale0 allowed, everything else denied — the box had no firewall
+at all), and only tailnet devices can read previews, which is the accepted
+cost. Known tradeoffs: the comment token is host-wide and reaches exec
+containers (per-channel token is a Phase 2 item), and the server runs as
+root on the host (dedicated user is a Phase 2 item).
+
 ## Major open questions
 
 1. **Permission policy and the judge.** The mechanism is settled: `@gotgenes/pi-permission-system` for allow/ask/deny, its `authorizerChain` for the light-model judge that auto-resolves asks (see Permissions). The work is policy: the ask-categories — email sends, outbound writes, `git push`, anything money-adjacent, which should be always-human and never judge-resolved — and the judge's model — cheap, fast, low-retention (see Permissions for the candidates and the ZDR caveat). Noise is the failure mode: a judge consulted too often gets switched off. Decide empirically in Phase 3.

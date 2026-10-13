@@ -125,11 +125,24 @@ async function ensureExecContainer(conversationId, stream) {
   const channelSkills = path.join(env.SKILLS_DIR, stream);
   if (existsSync(globalSkills)) mounts.push("-v", `${globalSkills}:/skills:ro`);
   if (existsSync(channelSkills)) mounts.push("-v", `${channelSkills}:/channel-skills:ro`);
+  // mark (markdown preview) wiring, when the sidecar is configured. The
+  // token reaches the container on purpose: it lets an agent register its
+  // own docs for preview. It can only write .comments.md files beside
+  // registered docs — no other capability.
+  const markEnv =
+    process.env.MARK_HOST && process.env.MARK_TOKEN
+      ? [
+          "-e", `MARK_HOST=${process.env.MARK_HOST}`,
+          "-e", `MARK_TOKEN=${process.env.MARK_TOKEN}`,
+          "-e", `MARK_CHANNEL=${stream}`,
+        ]
+      : [];
   const run = await sh([
     "run", "-d", "--rm",
     "--name", name,
     "--label", "family-agent-exec=1",
     ...mounts,
+    ...markEnv,
     "-w", "/workspace",
     env.EXEC_IMAGE,
     "sleep", "infinity",

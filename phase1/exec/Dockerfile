@@ -12,5 +12,8 @@ RUN git config --global user.name "pi (family-agent)" \
  && git config --global init.defaultBranch main \
  && git config --global safe.directory '*'
 
+COPY mark /usr/local/bin/mark
+RUN chmod +x /usr/local/bin/mark
+
 WORKDIR /workspace
 CMD ["sleep", "infinity"]

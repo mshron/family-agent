@@ -53,6 +53,14 @@ The Zulip bot is the existing "Nanobot" bot user, on the private stream
   streams (auto-subscribed at boot) and per-channel tool overrides
   (`tools` replaces, `add` appends to the standard set). Removing the bot
   from a stream stops that channel's poller.
+- **mark (markdown preview).** The `mark <file.md>` command registers a
+  doc with a preview server on the box and prints a tailnet URL; agents
+  post the URL in chat, and the reader (on a tailnet device) gets a live
+  preview with click-to-comment review (comments land in
+  `<file>.comments.md` beside the doc). Requires Tailscale on the box
+  (the sidecar binds only the tailscale address) and
+  `MARK_HOST`/`MARK_TOKEN` in `.env`; the sidecar itself is installed on
+  the box, not from this repo.
 - **Skills.** Two read-only layers mounted into every exec container:
   `/skills` (global) and `/channel-skills` (this channel). Install with
   `phase1/skills/install.sh <git-url-or-path> [--global | --channel NAME]`.

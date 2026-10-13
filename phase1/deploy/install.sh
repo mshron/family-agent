@@ -41,9 +41,15 @@ for s in "${STREAMS[@]}"; do
 done
 mkdir -p durable
 
-# Skill layers: read-only for agents, one dir per layer.
+# Skill layers: read-only for agents, one dir per layer. Skills shipped in
+# the repo are (re)installed into the global layer on every deploy.
 mkdir -p skills/global
 for s in "${STREAMS[@]}"; do mkdir -p "skills/$s"; done
+for d in phase1/skills/*/; do
+  name="$(basename "$d")"
+  [ "$name" = "install.sh" ] && continue
+  bash phase1/skills/install.sh "phase1/skills/$name" --global
+ done
 
 # Push secrets for the meta channel (deploy key + known_hosts), mode 600.
 mkdir -p secrets/push

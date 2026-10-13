@@ -1,0 +1,73 @@
+#!/usr/bin/env node
+// mark — register a workspace doc with the host mark sidecar and print a
+// tailnet preview URL for it. The gateway injects MARK_HOST (the box's
+// Tailscale address), MARK_TOKEN (the sidecar's bearer token), and
+// MARK_CHANNEL (this workspace's channel key). There is no browser here:
+// the agent posts the printed URL into the conversation for the reader.
+//
+// The sidecar only acts on documents registered here, by exact real path
+// (the host path this container's /workspace is a mount of).
+const http = require("node:http");
+const path = require("node:path");
+
+const host = process.env.MARK_HOST;
+const token = process.env.MARK_TOKEN;
+const channel = process.env.MARK_CHANNEL;
+const file = process.argv[2];
+
+if (!file) {
+  console.error("usage: mark <file.md>");
+  process.exit(1);
+}
+if (!host || !token || !channel) {
+  console.error("mark: MARK_HOST, MARK_TOKEN, or MARK_CHANNEL is not set");
+  process.exit(1);
+}
+
+const abs = path.resolve(file);
+if (!abs.startsWith("/workspace/")) {
+  console.error(`mark: ${file} is not inside /workspace`);
+  process.exit(1);
+}
+// The host path of the same file: this container mounts
+// workspaces/<channel> at /workspace.
+const hostPath =
+  "/opt/family-agent/workspaces/" + channel + abs.slice("/workspace".length);
+
+const post = (p, body) =>
+  new Promise((resolve, reject) => {
+    const req = http.request(
+      {
+        host,
+        port: 31622,
+        path: p,
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${token}`,
+          "content-type": "application/json",
+        },
+      },
+      (res) => {
+        let out = "";
+        res.on("data", (c) => (out += c));
+        res.on("end", () => resolve({ code: res.statusCode, body: out }));
+      }
+    );
+    req.on("error", reject);
+    req.setTimeout(5000, () => req.destroy(new Error("timeout")));
+    req.end(JSON.stringify(body));
+  });
+
+(async () => {
+  try {
+    const res = await post("/_mark/register", { file: hostPath });
+    if (res.code !== 200) {
+      console.error(`mark: registration failed (${res.code}): ${res.body}`);
+      process.exit(1);
+    }
+    console.log(`http://${host}:31622/viewer${hostPath}#ct=${token}`);
+  } catch (err) {
+    console.error(`mark: cannot reach the sidecar: ${err.message}`);
+    process.exit(1);
+  }
+})();
