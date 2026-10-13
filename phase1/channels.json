@@ -1,10 +1,21 @@
 {
   "streams": ["scratch", "meta"],
+  "permissions": {
+    "bash": {
+      "rm -rf /*": "deny",
+      "sudo *": "deny"
+    }
+  },
   "channels": {
     "scratch": {},
     "meta": {
       "add": ["push_changes"],
-      "push": true
+      "push": true,
+      "permissions": {
+        "tools": {
+          "push_changes": "ask"
+        }
+      }
     },
     "dm": {}
   }

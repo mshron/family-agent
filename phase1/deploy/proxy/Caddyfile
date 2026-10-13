@@ -1,0 +1,35 @@
+# Credential proxy (Phase 2, gateway-box asset). NOT deployed yet: it activates
+# with the two-box split (docs/memos/phase2-hardening.md). Kept in the repo so
+# the configuration is reviewed like code, not invented on the box at 2am.
+#
+# Shape: the session box's gateway process points LLM_BASE_URL at this proxy
+# (e.g. http://10.0.0.4:8080/llm) and carries a placeholder key; Caddy holds
+# the real OpenRouter key and injects the Authorization header upstream. The
+# gateway process is trusted either way — the proxy's lasting value is that
+# key material stops living in the process environment that talks to the
+# untrusted half of the network, and that open-world responses (Phase 3:
+# email, fetch) pass through a checkpoint that can scan them.
+#
+# Run: docker run -d --name fa-proxy -p 127.0.0.1:8080:8080 \
+#        -e OPENROUTER_API_KEY=... -v ./Caddyfile:/etc/caddy/Caddyfile:ro caddy:2
+
+{
+	admin off
+	auto_https off
+}
+
+:8080 {
+	# LLM upstream. Sessions/gateway send no Authorization header worth
+	# anything; the proxy replaces it.
+	handle_path /llm/* {
+		reverse_proxy https://openrouter.ai {
+			header_up Host openrouter.ai
+			header_up Authorization "Bearer {env.OPENROUTER_API_KEY}"
+		}
+	}
+
+	# Later (Phase 3): /search and /fetch upstreams for open-world tool
+	# responses, with the ingress scanner in front of them.
+
+	respond 404
+}

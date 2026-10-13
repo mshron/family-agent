@@ -315,7 +315,7 @@ export function buildZulipTools({ onThreadCreated, onPushChanges }) {
   const pushChangesTool = defineTool({
     name: "push_changes",
     description:
-      "Push the workspace repository's commits to the origin remote on GitHub (branch main). Run this after committing work that should deploy; CI/CD picks it up from there.",
+      "Push the workspace repository's commits to the origin remote on GitHub (branch main). The gateway first posts an approval message in the topic listing the commits; the push runs only after the owner reacts with a check mark (auto-denied after 20 minutes). Use it after committing work that should deploy; CI/CD picks it up from there.",
     parameters: Type.Object({}),
     replay: "safe",
     async execute(_args, api, context) {

@@ -108,10 +108,39 @@ Push secrets (after editing them locally): `bash phase1/deploy/push-secrets.sh`.
 ## The rules that make running bare acceptable
 
 No email, no finance repo, no deploy keys. Search results are the only
-untrusted text entering a conversation. When Phase 2 lands, rotate
-everything Phase 1 could have seen: the Zulip bot key and the OpenRouter key.
+untrusted text entering a conversation. Phase 2 landed the permission gates
+and the audit log (next section); the rotation checklist is in
+`docs/memos/phase2-hardening.md` (rotate the Zulip bot key and the
+OpenRouter key when the box split happens).
 (While debugging the Zulip event API, the bot key appeared in base64 in a
 terminal transcript — one more reason to rotate at Phase 2.)
+
+## Phase 2 — permission gates and audit log (live)
+
+The hardening layer runs on the single box now; the two-box split, proxy,
+egress lockdown, and rotation are staged as assets plus a runbook in
+`docs/memos/phase2-hardening.md`.
+
+- **Rules** live in `phase1/channels.json`. A top-level `permissions.bash`
+  map applies everywhere (shipped: `rm -rf /*` and `sudo *` denied); a
+  channel's `permissions.tools` map gates named tools. Semantics:
+  wildcard patterns (`*` matches anything), **last matching rule wins**, so
+  put catch-alls first; unmatched calls are allowed.
+- **`push_changes` in #meta is gated**: the gateway posts an approval
+  message listing the pending commits; react ✅ to approve, ❌ to deny.
+  Only `ZULIP_OWNER_EMAILS` users may approve. Auto-denied after
+  `ASK_TIMEOUT_MINUTES` (default 20). Sessions cannot forge approvals —
+  they never see reaction events.
+- **Audit log**: `/opt/family-agent/audit/audit.jsonl`, one JSON line per
+  event (tool decisions and outcomes, pushes, commands, threads,
+  boot/shutdown). Gateway-only mount; sessions cannot read it.
+- **Fail-open vs fail-closed**: a bug in rule classification fails open
+  (logged, audited) so sessions keep working; a failure of the approval
+  flow itself blocks the action — no surface, no consent.
+- **Pre-deploy checks** (run from `phase1/gateway/`):
+  `node scripts/permissions-contract.mjs` and
+  `node scripts/permissions-smoke.mjs` (the latter spins a fake model
+  server; no network beyond localhost).
 
 ## The #meta channel (self-modification)
 
@@ -119,7 +148,9 @@ terminal transcript — one more reason to rotate at Phase 2.)
 of the family-agent repo, so agents there edit real code with the normal
 tools, and `push_changes` runs `git push origin main` with a deploy key that
 lives only on the box's gateway side (agents can trigger a push, never read
-the key). A push triggers the GitHub Actions workflow
+the key). Since Phase 2, the push is approval-gated: the gateway posts the
+pending commits in the topic and pushes only after the owner reacts ✅.
+A push triggers the GitHub Actions workflow
 (`.github/workflows/deploy.yml`) which connects to the box and runs
 `phase1/deploy/pull-deploy.sh` (reset the meta clone to `origin/main`, rsync
 `phase1/`, redeploy). Secrets stay outside the repo tree on the box.
@@ -242,7 +273,7 @@ a deliberate act:
 
 - Every deploy resets the meta clone to `origin/main`. Work that is
   committed but not pushed is discarded by the next deploy; uncommitted
-  work is lost. Commit, then `push_changes`.
+  work is lost. Commit, then `push_changes` (and the owner approves).
 - Every deploy restarts the gateway. In-flight runs complete in the durable
   store but their replies may not post; ask the user to resend if one is
   missing.
@@ -256,10 +287,15 @@ Push any commit to `main` and watch it land
 (`gh run watch` or Actions → deploy), then on the box:
 `docker logs fa-gateway` and `git -C /opt/family-agent/workspaces/meta log -1`.
 
-## Known limitations (accepted for the feel test)
+## Known limitations
 
-- Credentials sit in the gateway environment; no proxy, no permission
-  gates, no log service (Phase 2). Exec containers get none of them.
+- Credentials sit in the gateway environment until the box split: no
+  proxy, no egress lockdown yet. Exec containers get none of them (no keys,
+  and they never see `.env`); the credential proxy config and the egress
+  script are staged in `deploy/proxy/` and `deploy/egress-lockdown.sh`.
+- A run interrupted by a restart while waiting on an approval resumes but
+  may refuse on timeout (the approval message is reused, not duplicated);
+  interrupted runs' replies may not post (existing gap).
 - Old (pre-migration) pi session files were not imported: topics that had
   history in the RPC gateway start fresh in the durable store. The
   workspace, memory, and notes carry the durable parts.

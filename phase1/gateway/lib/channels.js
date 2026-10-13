@@ -3,6 +3,7 @@
 // so a config change needs only a gateway restart, not a rebuild.
 
 import { readFile } from "node:fs/promises";
+import { mergePermissionConfig } from "./permissions.js";
 
 /** Tool names every channel gets unless the config says otherwise. */
 export const STANDARD_TOOLS = [
@@ -42,6 +43,16 @@ export class ChannelConfig {
     }
     const added = Array.isArray(conf.add) ? conf.add : [];
     return [...new Set([...STANDARD_TOOLS, ...added])];
+  }
+
+  /**
+   * The permission rule config for one channel: the top-level
+   * `permissions` block merged with the channel's own, per surface.
+   * Keys the running gateway does not know are ignored, so an older
+   * deploy can run a newer channels.json (and vice versa).
+   */
+  permissionConfigFor(channel) {
+    return mergePermissionConfig(this.raw.permissions, this.channels[channel]?.permissions);
   }
 }
 

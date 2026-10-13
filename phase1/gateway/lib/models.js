@@ -9,11 +9,17 @@ import {
 } from "@earendil-works/pi-ai";
 import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
 
+// The OpenRouter endpoint. Setting LLM_BASE_URL points every model call at
+// the credential proxy instead (Phase 2's gateway box): the proxy holds the
+// real key and injects the Authorization header upstream, so this process
+// can run with a placeholder key. Unset: direct OpenRouter, as in Phase 1.
+const LLM_BASE_URL = process.env.LLM_BASE_URL || "https://openrouter.ai/api/v1";
+
 const MODELS = [
   {
     id: "z-ai/glm-5.3-flash",
     provider: "openrouter",
-    baseUrl: "https://openrouter.ai/api/v1",
+    baseUrl: LLM_BASE_URL,
     name: "GLM 5.3 Flash",
     api: "openai-completions",
     reasoning: true,
@@ -25,7 +31,7 @@ const MODELS = [
   {
     id: "z-ai/glm-5.3",
     provider: "openrouter",
-    baseUrl: "https://openrouter.ai/api/v1",
+    baseUrl: LLM_BASE_URL,
     name: "GLM 5.3",
     api: "openai-completions",
     reasoning: true,
@@ -42,7 +48,7 @@ export function buildModels() {
     createProvider({
       id: "openrouter",
       name: "OpenRouter",
-      baseUrl: "https://openrouter.ai/api/v1",
+      baseUrl: LLM_BASE_URL,
       auth: { apiKey: envApiKeyAuth("OpenRouter", ["OPENROUTER_API_KEY"]) },
       api: openAICompletionsApi(),
       models: MODELS,
@@ -63,7 +69,7 @@ export async function smallLlm({ apiKey, system, user, maxTokens = 500 }) {
   // retry with a larger budget covers runs where reasoning starves the answer.
   let lastError = "no response";
   for (let attempt = 0; attempt < 2; attempt++) {
-    const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+    const res = await fetch(`${LLM_BASE_URL}/chat/completions`, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${apiKey}`,

@@ -40,6 +40,8 @@ for s in "${STREAMS[@]}"; do
   fi
 done
 mkdir -p durable
+# Append-only audit log (Phase 2): gateway-only mount, never in exec containers.
+mkdir -p audit
 
 # Skill layers: read-only for agents, one dir per layer. Skills shipped in
 # the repo are (re)installed into the global layer on every deploy.

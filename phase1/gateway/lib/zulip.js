@@ -110,6 +110,21 @@ export class Zulip {
     return this.register([], ["subscription"]);
   }
 
+  /** Reactions to the bot's own messages (Zulip delivers those to the author). */
+  registerReactionQueue() {
+    return this.register([], ["reaction"]);
+  }
+
+  /** One user by id (name/email card); used for approval-integrity checks. */
+  getUser(userId) {
+    return this._call("GET", `users/${userId}`);
+  }
+
+  /** One user by email — id resolution for the owner cache at boot. */
+  getUserByEmail(email) {
+    return this._call("GET", `users/${encodeURIComponent(email)}`);
+  }
+
   registerPrivateQueue() {
     return this.register([["is", "private"]], MESSAGE_EVENT_TYPES);
   }

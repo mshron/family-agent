@@ -34,6 +34,8 @@ import { loadChannelConfig } from "./lib/channels.js";
 import { provisionStream } from "./lib/provision.js";
 import { buildZulipTools } from "./lib/tools.js";
 import { GENERAL_CHAT, nameTopic } from "./lib/naming.js";
+import { AuditLog } from "./lib/audit.js";
+import { buildPermissionsExtension, PermissionRules } from "./lib/permissions.js";
 
 const REPLY_CHAR_LIMIT = 9000;
 const SPOILER_RESULT_LIMIT = 700;
@@ -76,6 +78,8 @@ const env = {
   WORKSPACE_SKELETON_DIR: process.env.WORKSPACE_SKELETON_DIR || "/app/workspace-skeleton",
   OPENROUTER_API_KEY: requireEnv("OPENROUTER_API_KEY"),
   IDLE_MINUTES: Number(process.env.IDLE_MINUTES) || IDLE_MINUTES,
+  AUDIT_DIR: process.env.AUDIT_DIR || "/opt/family-agent/audit",
+  ASK_TIMEOUT_MS: (Number(process.env.ASK_TIMEOUT_MINUTES) || 20) * 60_000,
   ZULIP_OWNER_EMAILS: (process.env.ZULIP_OWNER_EMAILS || "")
     .split(",")
     .map((s) => s.trim())
@@ -89,6 +93,37 @@ const zulip = new Zulip({
   apiKey: env.ZULIP_API_KEY,
 });
 const channelConfig = await loadChannelConfig(env.CHANNELS_FILE);
+const audit = new AuditLog(env.AUDIT_DIR);
+
+// Approval integrity: only the configured owners may resolve an ask. Ids
+// are cached at boot (email -> id lookups can be hidden by the org's email
+// visibility policy); unknown reactors fail closed but the ask stays live.
+const ownerIds = new Map(); // user id -> email
+async function isOwner(userId) {
+  const cached = ownerIds.get(userId);
+  if (cached) return cached;
+  try {
+    const body = await zulip.getUser(userId);
+    const email = body?.user?.email;
+    if (email && env.ZULIP_OWNER_EMAILS.includes(email)) {
+      ownerIds.set(userId, email);
+      return email;
+    }
+  } catch {
+    /* not an owner we can verify: fail closed */
+  }
+  return null;
+}
+async function cacheOwnerIds() {
+  for (const email of env.ZULIP_OWNER_EMAILS) {
+    try {
+      const body = await zulip.getUserByEmail(email);
+      if (body?.user?.user_id) ownerIds.set(body.user.user_id, body.user.email ?? email);
+    } catch (err) {
+      log.warn(`owner lookup failed for ${email}: ${err.message}`);
+    }
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Docker helpers (run in the gateway container, over the mounted socket)
@@ -173,9 +208,29 @@ async function pushWorkspaceToOrigin(conversationId, stream) {
     "git", "push", "origin", "HEAD:main",
   ]);
   const text = `${run.stdout || ""}${run.stderr || ""}`.trim().slice(0, 600);
-  return run.code === 0
+  const ok = run.code === 0;
+  audit.record("push", { stream, ok, output: text.slice(0, 300) });
+  return ok
     ? `Pushed to origin main.\n${text}`
     : `Push failed:\n${text}`;
+}
+
+/** What the owner is approving: commits and diffstat ahead of origin/main. */
+async function summarizePendingPush(stream) {
+  if (!channelConfig.channels[stream]?.push) return "";
+  const ws = workspaceDir(env, stream);
+  const run = await sh([
+    "run", "--rm",
+    "-v", `${ws}:/workspace`,
+    "-w", "/workspace",
+    env.EXEC_IMAGE,
+    "sh", "-c",
+    "git log --oneline --no-decorate origin/main..HEAD 2>/dev/null | head -15; " +
+      "echo '---'; git diff --stat origin/main..HEAD 2>/dev/null | tail -1",
+  ]);
+  const text = (run.stdout || "").trim();
+  if (!text || text === "---") return "";
+  return `Commits ahead of origin/main:\n\n\`\`\`\n${text.slice(0, 1200)}\n\`\`\``;
 }
 
 // ---------------------------------------------------------------------------
@@ -189,6 +244,11 @@ const FamilySections = defineExtension({
 const ZulipTools = buildZulipTools({
   onThreadCreated: (conversationId, mapping) => {
     registerConversation(conversationId, mapping);
+    audit.record("thread", {
+      stream: mapping.stream,
+      topic: mapping.topic,
+      task: mapping.task ? String(mapping.task).slice(0, 200) : undefined,
+    });
     if (mapping.header) {
       zulip
         .sendStreamMessage(mapping.stream, mapping.topic, mapping.header)
@@ -206,6 +266,52 @@ const registry = createRegistry();
 registry.install(CodingTools);
 registry.install(ZulipTools);
 registry.install(FamilySections);
+
+// The permission layer (Phase 2): deterministic rules per channel over every
+// tool call, with the "ask" flow resolved by an owner's reaction on the
+// approval message. Sessions never see reaction events, so approvals cannot
+// be forged from inside a conversation.
+const rulesCache = new Map();
+const rulesFor = (channel) => {
+  if (!channel) return null;
+  if (!rulesCache.has(channel)) {
+    rulesCache.set(channel, new PermissionRules(channelConfig.permissionConfigFor(channel)));
+  }
+  return rulesCache.get(channel);
+};
+const permissions = buildPermissionsExtension({
+  rulesFor,
+  audit,
+  askTimeoutMs: env.ASK_TIMEOUT_MS,
+  isOwner,
+  post: async (conversationId, content) => {
+    const mapping = byId.get(conversationId);
+    if (!mapping) throw new Error(`no topic mapping for conversation ${conversationId}`);
+    const posted = mapping.recipients
+      ? await zulip.sendPrivateMessage(mapping.recipients, content)
+      : await zulip.sendStreamMessage(mapping.stream, mapping.topic, content);
+    const messageId = posted?.id ?? posted?.message?.id;
+    if (!messageId) throw new Error("Zulip returned no message id");
+    return messageId;
+  },
+  noteDecision: async (conversationId, text) => {
+    const mapping = byId.get(conversationId);
+    if (!mapping) return;
+    if (mapping.recipients) await zulip.sendPrivateMessage(mapping.recipients, text);
+    else await zulip.sendStreamMessage(mapping.stream, mapping.topic, text);
+  },
+  describe: async (channel, call) => {
+    if (call?.name === "push_changes") {
+      try {
+        return await summarizePendingPush(channel);
+      } catch {
+        return "";
+      }
+    }
+    return "";
+  },
+});
+registry.install(permissions.extension);
 
 /** Name -> ToolRegistration, for per-channel tool selection. */
 const toolByName = new Map(
@@ -1114,6 +1220,7 @@ async function handleCommand(route, content) {
   const [rawCmd, ...rest] = trimmed.slice(1).split(/\s+/);
   const cmd = rawCmd.toLowerCase();
   const argStr = trimmed.slice(1 + rawCmd.length).trim();
+  audit.record("command", { channel: route.channel, command: cmd, arg: argStr.slice(0, 80) });
 
   const say = (text) =>
     route.reply(text).catch((err) =>
@@ -1512,6 +1619,40 @@ async function pollControlQueue() {
   }
 }
 
+/**
+ * Reaction queue: resolves pending permission asks. Zulip delivers
+ * reaction events for a message to its author, so the queue sees reactions
+ * on the bot's own approval messages; every other reaction is a miss on
+ * the pending map and drops out. The bot's own reactions are skipped so a
+ * decision note can never approve itself.
+ */
+async function pollReactionQueue() {
+  const q = { queueId: null, lastEventId: -1 };
+  for (;;) {
+    try {
+      if (!q.queueId) {
+        const reg = await zulip.registerReactionQueue();
+        q.queueId = reg.queue_id;
+        q.lastEventId = reg.last_event_id;
+        log.info(`reaction queue registered: ${q.queueId.slice(0, 8)}`);
+      }
+      const { events, lastEventId: newest } = await zulip.getEvents(q.queueId, q.lastEventId);
+      q.lastEventId = newest;
+      for (const event of events) {
+        if (event.type !== "reaction") continue;
+        if (botUserId !== null && event.user_id === botUserId) continue;
+        await permissions
+          .handleReactionEvent(event)
+          .catch((err) => log.error(`reaction handling failed: ${err.message}`));
+      }
+    } catch (err) {
+      log.warn(`reaction poll failed: ${err.message}; re-registering`);
+      q.queueId = null;
+      await new Promise((r) => setTimeout(r, 3000));
+    }
+  }
+}
+
 function pollLoop() {
   const q = { kind: "private", queueId: null, lastEventId: -1 };
   void pollQueueForever(q);
@@ -1557,15 +1698,25 @@ async function main() {
   const me = await zulip.getMe();
   botUserId = me.user_id;
   log.info(`gateway bot: ${me.full_name} <${me.email}> (user_id ${botUserId})`);
+  audit.record("boot", { bot: me.email, pid: process.pid });
+  await cacheOwnerIds();
+  if (env.ZULIP_OWNER_EMAILS.length > 0 && ownerIds.size === 0) {
+    log.warn(
+      "no owner ids resolved: permission asks will post but can never be approved " +
+        "(check ZULIP_OWNER_EMAILS and the org's email visibility policy)"
+    );
+  }
   for (const dir of channelConfig.streams) {
     await mkdir(path.join(env.WORKSPACES_DIR, dir), { recursive: true });
   }
   await ensureStreamAccess();
   await discoverStreams();
   void pollControlQueue();
+  void pollReactionQueue();
 
   const shutdown = async (sig) => {
     log.info(`${sig} received; shutting down`);
+    audit.record("shutdown", { signal: sig });
     for (const [, state] of watchers) {
       try {
         await state.events.stop();

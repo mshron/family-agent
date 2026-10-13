@@ -22,8 +22,12 @@ all of it.
 ## How deploys work
 
 1. You commit your work here.
-2. You call `push_changes`. The gateway pushes `origin main` using a
-   deploy key that only the gateway can read.
+2. You call `push_changes`. The gateway posts an approval message in this
+   topic (the commits it will push); the owner reacts ✅ to approve. Only
+   then does the gateway push `origin main`, using a deploy key that only
+   the gateway can read. An unapproved push auto-denies after 20 minutes —
+   if that happens, tell the user what is pending and call `push_changes`
+   again when they are around.
 3. GitHub Actions runs the `deploy` workflow, which connects to the box
    and runs `phase1/deploy/pull-deploy.sh`: this clone is reset to
    `origin/main`, `phase1/` is copied to `/opt/family-agent/phase1`, and
@@ -31,10 +35,18 @@ all of it.
 
 Consequences:
 
-- Push promptly — after each commit, not at the end of the task. A deploy
-  (yours or anyone else's) resets this clone to `origin/main` at any time:
-  unpushed commits are discarded, uncommitted changes are lost. If you are
-  holding work you cannot push yet, say so out loud before continuing.
+- Commit promptly, and request approval promptly after each commit — a
+  deploy (yours or anyone else's) resets this clone to `origin/main` at
+  any time: unpushed commits are discarded, uncommitted changes are lost.
+  If you are holding work you cannot push yet, say so out loud before
+  continuing.
+- A push that ships a change to `phase1/gateway/` restarts the gateway
+  that is running your own conversation. Verify before pushing: run
+  `node scripts/permissions-contract.mjs` and
+  `node scripts/permissions-smoke.mjs` from `phase1/gateway/` when the
+  permission layer changed, and `node --check` every gateway file you
+  touched. A broken gateway cannot post replies, and you cannot fix a
+  system you have bricked.
 - A deploy restarts the gateway. Runs that are in flight complete in the
   durable store, but their replies may not post. If the user reports a
   missing reply, tell them to resend.
