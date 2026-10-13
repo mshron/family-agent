@@ -31,9 +31,10 @@ all of it.
 
 Consequences:
 
-- Commit and push before you finish. A deploy resets this clone to
-  `origin/main`: unpushed commits are discarded, uncommitted changes are
-  lost.
+- Push promptly — after each commit, not at the end of the task. A deploy
+  (yours or anyone else's) resets this clone to `origin/main` at any time:
+  unpushed commits are discarded, uncommitted changes are lost. If you are
+  holding work you cannot push yet, say so out loud before continuing.
 - A deploy restarts the gateway. Runs that are in flight complete in the
   durable store, but their replies may not post. If the user reports a
   missing reply, tell them to resend.

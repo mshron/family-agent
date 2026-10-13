@@ -7,6 +7,8 @@
 // so there is no quoting ambiguity. File ops map to coreutils in the container.
 
 import { spawn } from "node:child_process";
+import { readFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import path from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { ExecutionError, FileError } from "@earendil-works/pi-durable/env";
@@ -16,6 +18,104 @@ const err = (error) => ({ ok: false, error });
 
 function fileErr(code, message, p) {
   return new FileError(code, message, p);
+}
+
+// The read tool needs BinaryReader.scanLines, whose semantics (streaming
+// WHATWG decode, byte-order-mark handling, slice-like negative ends) are
+// subtle. pi-durable ships the reference LineScanner in its own dist — the
+// gateway copies it into the container and drives it, so the semantics track
+// whatever version is installed instead of a reimplementation drifting.
+const SCAN_DIR = "/tmp/.fa-line-scan";
+let scanSources;
+
+function lineScanSources() {
+  if (!scanSources) {
+    const require = createRequire(import.meta.url);
+    const lineScanPath = require.resolve(
+      "@earendil-works/pi-durable/dist/env/line-scan.js"
+    );
+    const dir = path.dirname(lineScanPath);
+    scanSources = {
+      lineScan: readFileSync(lineScanPath, "utf8").replace(
+        /from "\.\/decode\.js"/g,
+        `from "${SCAN_DIR}/decode.js"`
+      ),
+      decode: readFileSync(path.join(dir, "decode.js"), "utf8"),
+      driver: `import { LineScanner } from "${SCAN_DIR}/line-scan.js";
+import { closeSync, openSync, readSync } from "node:fs";
+const [, , file, start, end] = process.argv;
+const scanner = new LineScanner(Number(start), end === "" ? undefined : Number(end));
+const fd = openSync(file, "r");
+try {
+  const chunk = new Uint8Array(64 * 1024);
+  for (;;) {
+    const n = readSync(fd, chunk, 0, chunk.length, null);
+    if (n === 0) break;
+    scanner.push(chunk.subarray(0, n));
+  }
+} finally {
+  closeSync(fd);
+}
+process.stdout.write(JSON.stringify(scanner.finish()));
+`,
+    };
+  }
+  return scanSources;
+}
+
+class DockerBinaryReader {
+  /** The env, for _execArgv and fileInfo; the path this reader is bound to. */
+  env;
+  file;
+
+  constructor(env, file) {
+    this.env = env;
+    this.file = file;
+  }
+
+  async info(context) {
+    return this.env.fileInfo(this.file, context);
+  }
+
+  async read(offset, length, context) {
+    if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(length) || length < 0) {
+      return err(fileErr("invalid", `invalid read range: ${offset}+${length}`, this.file));
+    }
+    const script =
+      'const fs = require("node:fs");' +
+      "const fd = fs.openSync(process.argv[1], \"r\");" +
+      "try {" +
+      'const buf = Buffer.alloc(Number(process.argv[3]));' +
+      "const n = fs.readSync(fd, buf, 0, buf.length, Number(process.argv[2]));" +
+      "process.stdout.write(buf.subarray(0, n).toString(\"base64\"));" +
+      "} finally { fs.closeSync(fd); }";
+    const r = await this.env._execArgv([
+      "node", "-e", script, this.file, String(offset), String(length),
+    ]);
+    if (r.exitCode !== 0) return err(this.env._readError(this.file, r));
+    return ok(new Uint8Array(Buffer.from(r.stdout, "base64")));
+  }
+
+  async scanLines(options, context) {
+    const r = await this.env._execArgv([
+      "node", `${SCAN_DIR}/driver.mjs`, this.file,
+      String(options.startLine),
+      options.endLine === undefined ? "" : String(options.endLine),
+    ]);
+    if (r.exitCode !== 0) {
+      return err(fileErr("invalid", r.stderr || `scan failed: ${this.file}`, this.file));
+    }
+    try {
+      return ok(JSON.parse(r.stdout));
+    } catch {
+      return err(fileErr("unknown", `unparsable scan output: ${this.file}`, this.file));
+    }
+  }
+
+  async close(_context) {
+    // No file descriptor is held between calls; each read opens and closes.
+    return Promise.resolve();
+  }
 }
 
 class DockerTextLineReader {
@@ -43,6 +143,7 @@ export class DockerExecutionEnv {
   constructor({ container, cwd = "/workspace", dockerBin = "docker" }) {
     this.id = container;
     this.cwd = cwd;
+    this._scanReady = false;
     this.dockerBin = dockerBin;
   }
 
@@ -202,6 +303,45 @@ export class DockerExecutionEnv {
     const r = await this._execArgv(["base64", "-w", "0", "--", p]);
     if (r.exitCode !== 0) return err(this._readError(p, r));
     return ok(new Uint8Array(Buffer.from(r.stdout, "base64")));
+  }
+
+  /** Write the LineScanner driver into the container, once per container. */
+  async _ensureScanScripts() {
+    if (this._scanReady) return;
+    const src = lineScanSources();
+    for (const [name, content] of [
+      ["decode.js", src.decode],
+      ["line-scan.js", src.lineScan],
+      ["driver.mjs", src.driver],
+    ]) {
+      const r = await this._execArgv(
+        ["sh", "-c", `mkdir -p '${SCAN_DIR}' && cat > '${SCAN_DIR}/${name}'`, "sh"],
+        { input: content }
+      );
+      if (r.exitCode !== 0) {
+        throw new Error(`writing scan scripts to ${this.id} failed: ${r.stderr}`);
+      }
+    }
+    this._scanReady = true;
+  }
+
+  async openBinaryReader(p, options, context) {
+    const info = await this.fileInfo(p, context);
+    if (!info.ok) return info;
+    if (info.value.kind === "directory") {
+      return err(fileErr("is_directory", `is a directory: ${p}`, p));
+    }
+    if (info.value.kind !== "file") {
+      return err(fileErr("invalid", `not a regular file: ${p}`, p));
+    }
+    if (options?.noFollow === true) {
+      const link = await this._execArgv(["test", "-L", p]);
+      if (link.exitCode === 0) {
+        return err(fileErr("invalid", `not a regular file: ${p}`, p));
+      }
+    }
+    await this._ensureScanScripts();
+    return ok(new DockerBinaryReader(this, p));
   }
 
   async writeFile(p, content, _context) {
