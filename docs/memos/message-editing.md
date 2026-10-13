@@ -4,22 +4,23 @@ Design for "edit history" — a user edits or deletes a message they already
 sent, and the agent's durable history follows. Written 12 Oct 2026, from the
 #meta review; not yet implemented.
 
-## Open questions (awaiting Max)
+## Decisions (confirmed by Max 13 Oct 2026)
 
 1. **Case B fork scope.** The fork drops the edited message and everything
-   after it (the old topic keeps the full visible history). Intended?
+   after it; the old topic keeps its full visible history. Confirmed.
 2. **Fork topic naming.** Reuse the existing small-LLM topic namer
    (`nameTopic`, fed the old topic + corrected text), falling back to
-   `"<old> — edited"`? Or always deterministic?
+   `"<old> — edited"`. Confirmed.
 3. **Delete-of-latest.** Silent: the turn vanishes from context, the bot's
-   reply is deleted, nothing re-runs, nothing posted. Intended?
+   reply is deleted, nothing re-runs, nothing posted. Confirmed.
 4. **DM scope.** DMs support latest-message edit/delete only (there are no
    topics to fork into); an edit of an older DM message gets a note instead.
+   Confirmed.
 5. **Shipping gate.** The `edits` omit mechanism is public protocol but used
    here beyond what the codebase already exercises: gate on a faux-provider
    test of omit-on-a-real-turn plus a live matrix in #scratch (edit/delete,
    latest/older, idle/typing, DM, restart-mid-edit, delete-own-message
-   policy).
+   policy). Confirmed.
 
 ## Desired behavior
 
@@ -150,6 +151,53 @@ and prompt-cache prefix all survive.
   entry of that message's turn).
 - Topic renames arrive as `update_message` with subject fields and no
   content fields → ignored. Bot-authored messages are never in the index.
+
+## Steering and forced stop
+
+Editing covers "what I said was wrong"; the other half of the same problem is
+"what you are doing is wrong, stop". Today there is exactly one stop
+mechanism, and it is crude:
+
+- **`/stop`** — the gateway calls `conversation.abort(context)`. The run
+  settles `unanswered/aborted`, nothing is posted, and the entries the model
+  already wrote stay in context (a partial turn remains visible to the next
+  run). Queued follow-ups are withdrawn with it.
+- **Edit-of-latest (this memo)** is a second, stronger stop: it aborts *and*
+  rewinds — the aborted run's entries are omitted from context entirely, so
+  the conversation looks like the turn never happened.
+
+What is missing is **mid-run steering**: telling the agent something while it
+is already working, without restarting the turn. Three candidate shapes:
+
+1. **Queue-and-continue.** The user's message is submitted as a normal input;
+   pi-durable holds it as a queued follow-up and the live run picks it up at
+   the next tool-call boundary. Cheapest, but the agent only hears it at a
+   boundary — a long tool call (or a stuck one) delays it indefinitely.
+2. **Abort-and-replay (reuse Case A).** Treat a mid-run message as an edit of
+   the in-flight turn: abort, omit the aborted run's entries, and submit the
+   user's message as the new input. The agent restarts the turn having seen
+   the instruction, having lost only its own partial work. This is exactly the
+   Case A machinery, so it is nearly free — but it discards genuine progress
+   (a long tool result the agent would rather keep).
+3. **True injection.** Append a user entry to the live run's context between
+   turns of the agent loop (pi's native steering). Strongest UX, but it needs
+   a pi-durable primitive the codebase does not exercise yet — same shipping
+   risk as the `edits` omit mechanism, so it would need its own faux-provider
+   test.
+
+**Force-stop:** `/stop` is the force stop and it is as hard as it gets —
+`abort()` cancels the run at the provider/tool boundary. It cannot be
+ignored by the model because it never reaches the model. Two gaps worth
+closing when this ships: a tool call stuck inside the exec container is only
+reclaimed when its timeout fires (abort cancels the pending result, the
+capacity frees up, but the container-side process keeps running to its
+timeout), and there is no per-tool cancel UI — `Esc`-style interruption does
+not exist in Zulip, so `/stop` is all-or-nothing per run.
+
+Proposal: ship **`/stop` + edit-of-latest** (both exist in this design) and
+treat 2 (abort-and-replay) as the default steering behavior — it reuses the
+edit machinery verbatim and needs no new protocol surface. Revisit true
+injection once pi-durable 1.x exposes a steer primitive worth gating on.
 
 ## Accepted edges
 
