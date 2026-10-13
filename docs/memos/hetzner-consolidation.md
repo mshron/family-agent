@@ -286,6 +286,21 @@ See open question 3 — docker-zulip on the gateway box is the documented path. 
 
 ## Running log
 
+**2026-10-13 — /stop fixed: ordering gates + abort signal.** The "stop
+test" thread caught a real race: message handlers run fire-and-forget
+(the poll-loop fix), and a prompt's placement spends seconds in model
+routing — so a /stop sent seconds after a request overtook the placement,
+marked nothing, and lied ("Stopped." while the run went on to run four
+more tool calls). Fix: one durable effect at a time per conversation, in
+delivery order — a small order gate that covers commands and prompt
+placement, while runs still settle outside it (no lockstep between
+conversations, no waiting on long runs). Second fix in the same commit:
+`DockerExecutionEnv` now honors the tool abort signal — /stop kills the
+local docker exec at once (verified: submission settled 38 ms after /stop
+with a 120 s command mid-flight). Known gap, unchanged and documented in
+the message-editing memo: the process inside the container runs on to
+its own `timeout`.
+
 **2026-10-13 — read tool fixed in exec containers; deploy-reset race; model
 quirk.** Three findings from one #meta episode ("editing and forking"):
 (1) the `read` tool had never worked in exec containers —
