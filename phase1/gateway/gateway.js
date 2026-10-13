@@ -815,6 +815,21 @@ async function appendEditEntry(conversation, { messageId, event, action, queued,
 }
 
 /**
+ * The `narrow` parameter only filters `message` events, so edit and delete
+ * events arrive on every queue — one handler per poller would re-run an
+ * edited turn once per queue. Dedupe by the event's globally-unique id.
+ */
+const seenEditEvents = new Map(); // event key -> expiry
+function editEventSeen(event, messageId) {
+  const key = `${event.type}:${event.id ?? `${messageId}:${event.edit_timestamp ?? 0}`}`;
+  const now = Date.now();
+  for (const [k, expiry] of seenEditEvents) if (expiry < now) seenEditEvents.delete(k);
+  if (seenEditEvents.has(key)) return true;
+  seenEditEvents.set(key, now + 10 * 60_000);
+  return false;
+}
+
+/**
  * `update_message` handler: content edits only (moves and re-renders are
  * ignored). Latest-message edits re-run in place; older edits fork the
  * conversation into a new topic; DMs only support the latest.
@@ -822,6 +837,7 @@ async function appendEditEntry(conversation, { messageId, event, action, queued,
 async function handleUpdateMessage(event) {
   const messageId = event.message_id;
   event = { ...event, edit_timestamp: event.edit_timestamp ?? Date.now() };
+  if (editEventSeen(event, messageId)) return;
   const state = await classifyEditEvent(event, messageId, event.content !== undefined);
   if (!state) return;
   const { conversation, mapping, queued, entryId, isLatest, content } = state;
@@ -867,6 +883,7 @@ async function handleUpdateMessage(event) {
 async function handleDeleteMessage(event) {
   const ids = event.message_ids ?? (event.message_id ? [event.message_id] : []);
   event = { ...event, edit_timestamp: event.edit_timestamp ?? Date.now() };
+  if (editEventSeen(event, ids[0])) return;
   for (const messageId of ids) {
     const state = await classifyEditEvent(event, messageId, false);
     if (!state) continue;
