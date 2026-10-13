@@ -446,11 +446,10 @@ async function postSpoiler(conversationId, toolName, args, resultText) {
   const body = (resultText || "(no output)").slice(0, SPOILER_RESULT_LIMIT);
   const content = "```spoiler " + header + "\n" + body + "\n```";
   try {
-    if (mapping.recipients) {
-      await zulip.sendPrivateMessage(mapping.recipients, content);
-    } else {
-      await zulip.sendStreamMessage(mapping.stream, mapping.topic, content);
-    }
+    const posted = mapping.recipients
+      ? await zulip.sendPrivateMessage(mapping.recipients, content)
+      : await zulip.sendStreamMessage(mapping.stream, mapping.topic, content);
+    await recordTailPost(conversationId, posted);
   } catch (err) {
     log.warn(`spoiler post failed (${mapping.topic}): ${err.message}`);
   }
@@ -491,10 +490,417 @@ async function ensureWatcher(conversationId) {
 }
 
 // ---------------------------------------------------------------------------
+// Message edits and deletes (see docs/memos/message-editing.md)
+
+/**
+ * Routing index for edit/delete events: Zulip message id -> the conversation
+ * and the requestId of the message's current turn. Ring-buffered to the last
+ * ~1000 ingested messages. Written at ingestion time, before the run starts;
+ * an edit of the message rewrites its requestId to the corrected turn's.
+ */
+async function setIndex(messageId, conversationId, requestId) {
+  await harness.commit(async (tx) => {
+    const doc = await tx.doc(GatewayDoc);
+    doc.messages ??= {};
+    doc.messages[String(messageId)] = { conversationId, requestId };
+    const keys = Object.keys(doc.messages);
+    if (keys.length > 1000) {
+      for (const key of keys.slice(0, keys.length - 1000)) delete doc.messages[key];
+    }
+  }, context);
+}
+
+/**
+ * Resolve an edit/delete event to its conversation and current turn. The
+ * index is primary; a message older than the ring falls back to fetching it
+ * from Zulip (a deleted message cannot be fetched, so those drop out here).
+ */
+async function resolveMessageTarget(messageId) {
+  const gw = await harness.snapshot(GatewayDoc, context);
+  const hit = gw?.messages?.[String(messageId)];
+  if (hit) return hit;
+  const fresh = await zulip.getMessage(messageId).catch(() => null);
+  const m = fresh?.message;
+  if (!m || (botUserId !== null && m.sender_id === botUserId)) return null;
+  if (m.type === "private") {
+    const others = (m.display_recipient || []).filter((r) => r.id !== botUserId);
+    const key = byTopic.get(`dm::dm-${others.map((r) => r.id).sort().join("-")}`);
+    return key ? { conversationId: key, requestId: `zulip:${messageId}` } : null;
+  }
+  const key = byTopic.get(`${m.display_recipient}::${m.subject}`);
+  return key ? { conversationId: key, requestId: `zulip:${messageId}` } : null;
+}
+
+/** Turn start: only the current turn's posts may be deleted on an edit. */
+async function beginTailPosts(conversationId) {
+  await harness.commit(async (tx) => {
+    (await tx.doc(ZulipDoc, conversationId)).tailPosts = [];
+  }, context);
+}
+
+async function recordTailPost(conversationId, posted) {
+  const messageId = posted?.id ?? posted?.message?.id;
+  if (!messageId) return;
+  await harness.commit(async (tx) => {
+    const doc = await tx.doc(ZulipDoc, conversationId);
+    doc.tailPosts ??= [];
+    doc.tailPosts.push(messageId);
+    if (doc.tailPosts.length > 100) doc.tailPosts = doc.tailPosts.slice(-100);
+  }, context);
+}
+
+/** Delete the bot's posts of the current turn (best-effort, policy-bound). */
+async function deleteTailPosts(conversationId) {
+  const doc = await harness.snapshot(ZulipDoc, conversationId, context);
+  const ids = doc?.tailPosts ?? [];
+  const failed = [];
+  for (const id of ids) {
+    try {
+      await zulip.deleteMessage(id);
+    } catch (err) {
+      failed.push(id);
+      log.warn(`tail post delete failed (${id}): ${err.message}`);
+    }
+  }
+  await harness.commit(async (tx) => {
+    (await tx.doc(ZulipDoc, conversationId)).tailPosts = failed;
+  }, context);
+  return ids.length - failed.length;
+}
+
+/**
+ * True when a `zulip.edit` entry now overrides the entries of the turn this
+ * requestId submitted: the settled run is stale and its reply must not post.
+ */
+async function isSuperseded(conversationId, requestId) {
+  const record = await harness.commit(
+    (tx) => tx.submissionByRequest(conversationId, requestId),
+    context
+  );
+  if (!record?.entry) return false;
+  return harness.commit(async (tx) => {
+    const page = await tx.scanEntries({ conversationId }, 50);
+    return page.items.some(
+      (e) => e.kind === "zulip.edit" && (e.edits ?? []).some((t) => t.target === record.entry)
+    );
+  }, context);
+}
+
+/**
+ * Active-range entry ids at or above `fromId` (the input of the turn being
+ * edited): the stale input plus everything its run produced. Mirrors
+ * deriveContext's range: the newest head marker plus everything after it.
+ */
+async function collectTargets(tx, conversationId, fromId) {
+  const targets = new Set();
+  const marker = await tx.latestHeadMarker(conversationId);
+  if (marker && marker.id >= fromId) targets.add(marker.id);
+  let cursor;
+  for (;;) {
+    const page = await tx.scanEntries({ conversationId }, 100, cursor);
+    for (const e of page.items) if (e.id >= fromId) targets.add(e.id);
+    const oldest = page.items[page.items.length - 1]?.id;
+    cursor = page.next;
+    if (!cursor || (oldest !== undefined && oldest < fromId)) break;
+  }
+  return [...targets].sort((a, b) => a - b);
+}
+
+/** Newest pi.user entry id of a conversation, or undefined. */
+async function newestUserEntry(conversationId) {
+  return harness.commit(async (tx) => {
+    let cursor;
+    for (;;) {
+      const page = await tx.scanEntries({ conversationId }, 50, cursor);
+      const user = page.items.find((e) => e.kind === "pi.user");
+      if (user) return user.id;
+      cursor = page.next;
+      if (!cursor) return undefined;
+    }
+  }, context);
+}
+
+/** A route rebuilt from a conversation's mapping (for re-runs and forks). */
+function routeForMapping(mapping) {
+  if (mapping.recipients) {
+    return {
+      kind: "dm",
+      conversationKey: `dm::${mapping.topic}`,
+      reply: (content) => zulip.sendPrivateMessage(mapping.recipients, content),
+    };
+  }
+  return {
+    kind: "stream",
+    conversationKey: `${mapping.stream}::${mapping.topic}`,
+    reply: (content) => zulip.sendStreamMessage(mapping.stream, mapping.topic, content),
+  };
+}
+
+/**
+ * The re-run of an edited turn: submit the corrected text, post the answer
+ * where the original turn answered, and make the new turn current.
+ */
+async function runEditedTurn(conversation, route, { messageId, editTimestamp, content }) {
+  const requestId = `zulip:${messageId}:e${editTimestamp}`;
+  // Restart-safe: a re-delivered edit event finds this submission and skips.
+  const existing = await harness.commit(
+    (tx) => tx.submissionByRequest(conversation.id, requestId),
+    context
+  );
+  if (existing) return;
+  await zulip.addReaction(messageId, "eyes").catch(() => {});
+  try {
+    const doc = await harness.snapshot(ZulipDoc, conversation.id, context);
+    await applyAutoModel(conversation, doc, content);
+    await beginTailPosts(conversation.id);
+    const submission = await conversation.submit(
+      { type: "input", content, requestId, whenBusy: "followUp" },
+      context
+    );
+    await setIndex(messageId, conversation.id, requestId);
+    const settled = await submission.wait(context);
+    if (await isSuperseded(conversation.id, requestId)) {
+      log.info(`edited turn ${requestId} superseded; reply skipped`);
+      return;
+    }
+    const answer = await extractAnswer(conversation, settled);
+    if (!answer) return; // aborted: silent
+    const reply =
+      answer.length > REPLY_CHAR_LIMIT
+        ? `${answer.slice(0, REPLY_CHAR_LIMIT)}\n\n*(truncated — the full text is in the workspace)*`
+        : answer;
+    await recordTailPost(conversation.id, await route.reply(reply));
+  } finally {
+    await zulip.removeReaction(messageId, "eyes").catch(() => {});
+  }
+}
+
+/**
+ * Case B: the edited/deleted message is further back, so the conversation
+ * forks at that point into a new topic and the corrected branch continues
+ * there. Streams only.
+ */
+async function forkForEdit({ conversation, mapping, entryId, messageId, action, editTimestamp, content }) {
+  const base = await forkTopicName(mapping, content).catch(() => `${mapping.topic} — edited`);
+  const topic = uniqueTopic(mapping.stream, base);
+  const { forkId, fresh } = await harness.commit(async (tx) => {
+    const prev = (
+      await tx.scanEntries({ conversationId: conversation.id, maxEntryId: entryId - 1 }, 1)
+    ).items[0]?.id;
+    if (prev) {
+      const record = await tx.forkConversation(conversation.id, prev, {
+        ownership: { kind: "ownerless" },
+      });
+      return { forkId: record.id, fresh: false };
+    }
+    // The edited message was the first entry ever: start a fresh conversation.
+    const record = await tx.createConversation({ ownership: { kind: "ownerless" } });
+    return { forkId: record.id, fresh: true };
+  }, context);
+  if (fresh) {
+    const forkInit = await harness.conversation(forkId, context);
+    const tools = channelConfig
+      .toolsFor(mapping.stream)
+      .map((name) => toolByName.get(name))
+      .filter(Boolean);
+    await forkInit.configure(
+      {
+        model: MODEL_ALIASES.flash,
+        thinkingLevel: "low",
+        instructions: INSTRUCTIONS,
+        tools,
+      },
+      context
+    );
+  }
+  registerConversation(forkId, { stream: mapping.stream, topic });
+  await zulip
+    .sendStreamMessage(
+      mapping.stream,
+      topic,
+      `*(forked from "${mapping.topic}" — an earlier message was ${action === "edit" ? "edited" : "deleted"}; the corrected history continues here)*`
+    )
+    .catch((err) => log.warn(`fork header post failed: ${err.message}`));
+  await ensureWatcher(forkId).catch((err) =>
+    log.error(`watcher for fork ${forkId} failed: ${err.message}`)
+  );
+  return { forkId, topic, requestId: `zulip:${messageId}:e${editTimestamp}` };
+}
+
+/** Topic name for an edited fork: the namer, fed the old topic + corrected text. */
+async function forkTopicName(mapping, content) {
+  return nameTopic({
+    apiKey: env.OPENROUTER_API_KEY,
+    messages: [
+      { sender: `continuing topic "${mapping.topic}"`, content: "(the branch point)" },
+      { sender: "user", content: content ? stripHtml(content).slice(0, 500) : "(deleted)" },
+    ],
+  });
+}
+
+function uniqueTopic(stream, base) {
+  const taken = new Set(
+    [...byTopic.keys()]
+      .filter((k) => k.startsWith(`${stream}::`))
+      .map((k) => k.slice(stream.length + 2))
+  );
+  if (!taken.has(base)) return base;
+  for (let i = 2; ; i++) if (!taken.has(`${base} ${i}`)) return `${base} ${i}`;
+}
+
+/** One edit/delete event's shared prologue: resolve, classify, or bail. */
+async function classifyEditEvent(event, messageId, hasContent) {
+  const content = hasContent ? String(event.content || "").trim() : "";
+  if (hasContent && (!content || content.startsWith("/") || String(event.orig_content || "").trim().startsWith("/"))) {
+    return null; // rendering-only, move, or a slash command: never in the transcript
+  }
+  const target = await resolveMessageTarget(messageId);
+  if (!target) {
+    if (!hasContent) return null;
+    // Never ingested (the gateway was down): the corrected text is fresh input.
+    const fresh = await zulip.getMessage(messageId).catch(() => null);
+    const m = fresh?.message;
+    if (!m || (botUserId !== null && m.sender_id === botUserId)) return null;
+    const route =
+      m.type === "private" ? dmRoute(m) : streamRoute(m.display_recipient, m.subject);
+    await provisionStream(env, route.channel, log);
+    // raw_content is the markdown source; fall back to what the event or
+    // GET returned (rendered) when the policy does not expose it.
+    await promptRoute(route, {
+      ...m,
+      content: typeof m.raw_content === "string" ? m.raw_content : content,
+    });
+    return null;
+  }
+  const conversation = await harness.conversation(target.conversationId, context);
+  const mapping = byId.get(target.conversationId);
+  if (!conversation || !mapping) return null;
+  const sub = await harness.commit(
+    (tx) => tx.submissionByRequest(target.conversationId, target.requestId),
+    context
+  );
+  const queued = sub?.status === "queued";
+  const entryId = sub?.entry;
+  if (!queued && entryId === undefined) {
+    if (!hasContent) return null; // never placed: ignore deletions
+    // Known message but no placed turn: the corrected text is fresh input.
+    await promptRoute(routeForMapping(mapping), {
+      id: messageId,
+      content,
+      sender_id: event.user_id,
+    });
+    return null;
+  }
+  const isLatest = queued || (await newestUserEntry(target.conversationId)) === entryId;
+  return { conversation, mapping, queued, entryId, isLatest, content };
+}
+
+/** Append the durable edit marker that omits a turn from model context. */
+async function appendEditEntry(conversation, { messageId, event, action, queued, entryId }) {
+  await conversation.abort(context, { background: true });
+  await harness.commit(async (tx) => {
+    const targets = queued ? [] : await collectTargets(tx, conversation.id, entryId);
+    await tx.appendEntry(conversation.id, {
+      kind: "zulip.edit",
+      data: {
+        messageId,
+        editor: event.user_id ?? event.editor_id ?? null,
+        timestamp: event.edit_timestamp,
+        action,
+        targets,
+      },
+      edits: targets.map((target) => ({ target, action: "omit" })),
+    });
+  }, context);
+}
+
+/**
+ * `update_message` handler: content edits only (moves and re-renders are
+ * ignored). Latest-message edits re-run in place; older edits fork the
+ * conversation into a new topic; DMs only support the latest.
+ */
+async function handleUpdateMessage(event) {
+  const messageId = event.message_id;
+  event = { ...event, edit_timestamp: event.edit_timestamp ?? Date.now() };
+  const state = await classifyEditEvent(event, messageId, event.content !== undefined);
+  if (!state) return;
+  const { conversation, mapping, queued, entryId, isLatest, content } = state;
+  const route = routeForMapping(mapping);
+  if (isLatest) {
+    // Case A: stop the stale run, strike the turn from context and Zulip,
+    // re-run on the corrected text in place.
+    await appendEditEntry(conversation, { messageId, event, action: "edit", queued, entryId });
+    await deleteTailPosts(conversation.id);
+    await runEditedTurn(conversation, route, {
+      messageId,
+      editTimestamp: event.edit_timestamp,
+      content,
+    });
+    return;
+  }
+  if (mapping.recipients) {
+    await route
+      .reply(
+        "*(an edit of an older DM message can't be replayed — only edits of the latest message are followed here)*"
+      )
+      .catch(() => {});
+    return;
+  }
+  const { forkId, topic, requestId } = await forkForEdit({
+    conversation,
+    mapping,
+    entryId,
+    messageId,
+    action: "edit",
+    editTimestamp: event.edit_timestamp,
+    content,
+  });
+  await setIndex(messageId, forkId, requestId);
+  void runEditedTurn(await harness.conversation(forkId, context), streamRoute(mapping.stream, topic), {
+    messageId,
+    editTimestamp: event.edit_timestamp,
+    content,
+  }).catch((err) => log.error(`forked edit run failed: ${err.message}`));
+}
+
+/** `delete_message` handler: same shape as edits, but nothing re-runs. */
+async function handleDeleteMessage(event) {
+  const ids = event.message_ids ?? (event.message_id ? [event.message_id] : []);
+  event = { ...event, edit_timestamp: event.edit_timestamp ?? Date.now() };
+  for (const messageId of ids) {
+    const state = await classifyEditEvent(event, messageId, false);
+    if (!state) continue;
+    const { conversation, mapping, queued, entryId, isLatest } = state;
+    if (isLatest) {
+      // Silent: the turn vanishes from context, the bot's reply is deleted,
+      // nothing re-runs, nothing posted.
+      await appendEditEntry(conversation, { messageId, event, action: "delete", queued, entryId });
+      await deleteTailPosts(conversation.id);
+      continue;
+    }
+    if (mapping.recipients) continue; // DM deletes of older messages: ignore
+    const { forkId, topic, requestId } = await forkForEdit({
+      conversation,
+      mapping,
+      entryId,
+      messageId,
+      action: "delete",
+      editTimestamp: event.edit_timestamp,
+      content: "",
+    });
+    await setIndex(messageId, forkId, requestId);
+    log.info(`delete forked ${mapping.stream}/${mapping.topic} -> ${topic} (${forkId})`);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Message flow
 
 async function extractAnswer(conversation, settled) {
   if (settled.status !== "done") {
+    // Aborted runs (an edit arrived, or /stop) stay silent; the aborting
+    // flow posts its own notice.
+    if (settled.reason === "aborted") return "";
     return `*(no answer: ${settled.reason ?? "unknown"})*`;
   }
   const page = await conversation.entries(
@@ -524,6 +930,7 @@ async function runSpawnedThread(conversationId, mapping) {
     );
     const doc = await harness.snapshot(ZulipDoc, conversationId, context);
     await applyAutoModel(conversation, doc, mapping.task);
+    await beginTailPosts(conversationId);
     const submission = await conversation.submit(
       {
         type: "input",
@@ -535,7 +942,11 @@ async function runSpawnedThread(conversationId, mapping) {
     );
     const settled = await submission.wait(context);
     const answer = await extractAnswer(conversation, settled);
-    await zulip.sendStreamMessage(mapping.stream, mapping.topic, answer);
+    if (!answer) return; // aborted: silent
+    await recordTailPost(
+      conversationId,
+      await zulip.sendStreamMessage(mapping.stream, mapping.topic, answer)
+    );
     log.info(`thread reply posted (${answer.length} chars) -> ${mapping.stream}::${mapping.topic}`);
   } catch (err) {
     log.error(`thread reply failed: ${err.message}`);
@@ -581,6 +992,11 @@ async function ingestUploads(route, message) {
 async function promptRoute(route, message) {
   const conversation = await ensureConversation(route);
   await ensureWatcher(conversation.id);
+  // Edit/delete events resolve through this index; write it before the run
+  // starts so even a queued message is routable.
+  await setIndex(message.id, conversation.id, `zulip:${message.id}`);
+  // Only the current turn's posts are deleted on a later edit.
+  await beginTailPosts(conversation.id);
   const content = await ingestUploads(route, message);
   // Thinking indicator: an eyes reaction while the run is live, removed
   // when the reply posts (streams and DMs both).
@@ -599,12 +1015,19 @@ async function promptRoute(route, message) {
     );
     const settled = await submission.wait(context);
     log.info(`settled: ${JSON.stringify(settled).slice(0, 400)}`);
+    // A late edit: this run's turn was overridden while we were between
+    // settling and posting — the re-run owns the reply now.
+    if (await isSuperseded(conversation.id, `zulip:${message.id}`)) {
+      log.info(`turn for message ${message.id} superseded by an edit; reply skipped`);
+      return;
+    }
     const answer = await extractAnswer(conversation, settled);
+    if (!answer) return; // aborted: silent
     const reply =
       answer.length > REPLY_CHAR_LIMIT
         ? `${answer.slice(0, REPLY_CHAR_LIMIT)}\n\n*(truncated — the full text is in the workspace)*`
         : answer;
-    await route.reply(reply);
+    await recordTailPost(conversation.id, await route.reply(reply));
     log.info(`reply posted (${reply.length} chars) -> ${route.conversationKey}`);
   } finally {
     await zulip.removeReaction(message.id, "eyes").catch(() => {});
@@ -954,6 +1377,18 @@ async function pollQueueForever(q) {
       const { events, lastEventId: newest } = await zulip.getEvents(q.queueId, q.lastEventId);
       q.lastEventId = newest;
       for (const event of events) {
+        if (event.type === "update_message") {
+          void handleUpdateMessage(event).catch((err) =>
+            log.error(`update_message handling failed: ${err.message}`)
+          );
+          continue;
+        }
+        if (event.type === "delete_message") {
+          void handleDeleteMessage(event).catch((err) =>
+            log.error(`delete_message handling failed: ${err.message}`)
+          );
+          continue;
+        }
         if (event.type !== "message") continue;
         const message = event.message;
         if (botUserId !== null && message.sender_id === botUserId) continue;

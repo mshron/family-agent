@@ -79,6 +79,11 @@ The Zulip bot is the existing "Nanobot" bot user, on the private stream
   still sees the old one.
 - `/compact` — background compaction at the next turn boundary.
 - `/stop` — abort the current run.
+- Editing or deleting one of your messages is followed by the gateway:
+  the latest message re-runs in place (edit re-answers, delete silently
+  retracts the turn); an edit or delete further back forks the conversation
+  into a new topic that continues from before it (streams only — DMs follow
+  latest-message edits only). See `docs/memos/message-editing.md`.
 
 ## Ops
 

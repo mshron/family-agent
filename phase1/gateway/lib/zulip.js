@@ -1,5 +1,9 @@
 // Zulip REST client: long-poll one event queue, send and edit stream messages.
 
+// The `narrow` parameter only filters `message` events, so edit and delete
+// events for a stream arrive on that stream's queue regardless of narrow.
+export const MESSAGE_EVENT_TYPES = ["message", "update_message", "delete_message"];
+
 export class Zulip {
   constructor({ site, email, apiKey, fetchImpl = fetch }) {
     if (!site || !email || !apiKey) {
@@ -98,7 +102,7 @@ export class Zulip {
   }
 
   registerStreamQueue(streamName) {
-    return this.register([["stream", streamName]]);
+    return this.register([["stream", streamName]], MESSAGE_EVENT_TYPES);
   }
 
   /** No narrow: all subscription add/remove events for the bot itself. */
@@ -107,7 +111,7 @@ export class Zulip {
   }
 
   registerPrivateQueue() {
-    return this.register([["is", "private"]]);
+    return this.register([["is", "private"]], MESSAGE_EVENT_TYPES);
   }
 
   async getEvents(queueId, lastEventId) {
@@ -154,6 +158,14 @@ export class Zulip {
   /** One message by id (fresh subject/content, e.g. after a topic rename). */
   getMessage(messageId) {
     return this._call("GET", `messages/${messageId}`);
+  }
+
+  /**
+   * Delete one message. Subject to the organization's message-deletion
+   * policy and time limit — recent own messages are normally fine.
+   */
+  deleteMessage(messageId) {
+    return this._call("DELETE", `messages/${messageId}`);
   }
 
   /** Messages in one topic, oldest-last. */
