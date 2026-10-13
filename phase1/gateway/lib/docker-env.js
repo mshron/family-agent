@@ -45,7 +45,7 @@ function lineScanSources() {
         /from "\.\/decode\.js"/g,
         `from "${SCAN_DIR}/decode.js"`
       ),
-      decode: readFileSync(path.join(dir, "decode.js"), "utf8"),
+      decode: readFileSync(path.join(path.dirname(lineScanPath), "decode.js"), "utf8"),
       driver: `import { LineScanner } from "${SCAN_DIR}/line-scan.js";
 import { closeSync, openSync, readSync } from "node:fs";
 const [, , file, start, end] = process.argv;
