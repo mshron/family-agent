@@ -7,7 +7,7 @@
 // so there is no quoting ambiguity. File ops map to coreutils in the container.
 
 import { spawn } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
 import { StringDecoder } from "node:string_decoder";
@@ -31,10 +31,15 @@ let scanSources;
 function lineScanSources() {
   if (!scanSources) {
     const require = createRequire(import.meta.url);
-    const lineScanPath = require.resolve(
-      "@earendil-works/pi-durable/dist/env/line-scan.js"
-    );
-    const dir = path.dirname(lineScanPath);
+    // The package's exports map hides deep dist paths from require.resolve,
+    // so find the install root from the public "./env" entry and walk up.
+    let dir = path.dirname(require.resolve("@earendil-works/pi-durable/env"));
+    while (!existsSync(path.join(dir, "package.json"))) {
+      const parent = path.dirname(dir);
+      if (parent === dir) throw new Error("pi-durable install root not found");
+      dir = parent;
+    }
+    const lineScanPath = path.join(dir, "dist/env/line-scan.js");
     scanSources = {
       lineScan: readFileSync(lineScanPath, "utf8").replace(
         /from "\.\/decode\.js"/g,
