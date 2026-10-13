@@ -153,9 +153,17 @@ export class DockerExecutionEnv {
   }
 
   /** Run docker with argv (no shell). Resolves {exitCode, stdout, stderr}. */
-  _docker(args, { input, onOutput, timeoutMs } = {}) {
+  _docker(args, { input, onOutput, timeoutMs, signal } = {}) {
     return new Promise((resolve) => {
       const child = spawn(this.dockerBin, args, { stdio: ["pipe", "pipe", "pipe"] });
+      // /stop aborts the tool task; kill the local docker CLI so the call
+      // returns at once. (The process inside the container keeps running
+      // until its own `timeout` — no way to target it from here.)
+      const onAbort = () => child.kill("SIGKILL");
+      if (signal) {
+        if (signal.aborted) onAbort();
+        else signal.addEventListener("abort", onAbort, { once: true });
+      }
       let out = "";
       let errText = "";
       let done = false;
@@ -186,6 +194,7 @@ export class DockerExecutionEnv {
         if (done) return;
         done = true;
         clearTimeout(timer);
+        if (signal) signal.removeEventListener("abort", onAbort);
         resolve({ exitCode, stdout: out, stderr: errText });
       };
       const timer = timeoutMs
@@ -240,12 +249,21 @@ export class DockerExecutionEnv {
     // In-container timeout keeps runaway commands from outliving the tool call.
     const secs = opts.timeout ? Math.max(1, Math.ceil(opts.timeout / 1000)) : 3600;
     argv.push("timeout", "-k", "1", String(secs), "bash", "-c", command);
+    const signal = context?.abortSignal;
+    if (signal?.aborted) {
+      return err(new ExecutionError("aborted", `command aborted before it started: ${command.slice(0, 120)}`));
+    }
     const result = await this._docker(argv, {
       // pi-durable's Shell contract: onOutput(text, context, info) with
       // info = { stream }. `skipped` is only sent when a window omits output;
       // we transfer everything, so it stays undefined.
       onOutput: (text, stream) => opts.onOutput?.(text, context, { stream }),
+      signal,
     });
+    // The abort kill and a pre-start abort both land here.
+    if (signal?.aborted) {
+      return err(new ExecutionError("aborted", `command aborted: ${command.slice(0, 120)}`));
+    }
     if (result.exitCode === -1) {
       return err(
         new ExecutionError("timeout", `command timed out after ${secs}s: ${command.slice(0, 120)}`)

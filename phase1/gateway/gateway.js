@@ -650,14 +650,19 @@ async function runEditedTurn(conversation, route, { messageId, editTimestamp, co
   if (existing) return;
   await zulip.addReaction(messageId, "eyes").catch(() => {});
   try {
-    const doc = await harness.snapshot(ZulipDoc, conversation.id, context);
-    await applyAutoModel(conversation, doc, content);
-    await beginTailPosts(conversation.id);
-    const submission = await conversation.submit(
-      { type: "input", content, requestId, whenBusy: "followUp" },
-      context
-    );
-    await setIndex(messageId, conversation.id, requestId);
+    // Same ordering rule as fresh prompts: the placement must land in the
+    // conversation's order gate so a concurrent /stop cannot overtake it.
+    const submission = await inOrder(route.conversationKey, async () => {
+      const doc = await harness.snapshot(ZulipDoc, conversation.id, context);
+      await applyAutoModel(conversation, doc, content);
+      await beginTailPosts(conversation.id);
+      const sub = await conversation.submit(
+        { type: "input", content, requestId, whenBusy: "followUp" },
+        context
+      );
+      await setIndex(messageId, conversation.id, requestId);
+      return sub;
+    });
     const settled = await submission.wait(context);
     if (await isSuperseded(conversation.id, requestId)) {
       log.info(`edited turn ${requestId} superseded; reply skipped`);
@@ -766,10 +771,11 @@ async function classifyEditEvent(event, messageId, hasContent) {
     await provisionStream(env, route.channel, log);
     // raw_content is the markdown source; fall back to what the event or
     // GET returned (rendered) when the policy does not expose it.
-    await promptRoute(route, {
+    const freshMessage = {
       ...m,
       content: typeof m.raw_content === "string" ? m.raw_content : content,
-    });
+    };
+    await dispatchConversation(route, freshMessage.content, freshMessage);
     return null;
   }
   const conversation = await harness.conversation(target.conversationId, context);
@@ -784,11 +790,8 @@ async function classifyEditEvent(event, messageId, hasContent) {
   if (!queued && entryId === undefined) {
     if (!hasContent) return null; // never placed: ignore deletions
     // Known message but no placed turn: the corrected text is fresh input.
-    await promptRoute(routeForMapping(mapping), {
-      id: messageId,
-      content,
-      sender_id: event.user_id,
-    });
+    const freshInput = { id: messageId, content, sender_id: event.user_id };
+    await dispatchConversation(routeForMapping(mapping), freshInput.content, freshInput);
     return null;
   }
   const isLatest = queued || (await newestUserEntry(target.conversationId)) === entryId;
@@ -1006,7 +1009,11 @@ async function ingestUploads(route, message) {
 }
 
 /** One user message -> one conversation turn, with a thinking indicator. */
-async function promptRoute(route, message) {
+// Place a prompt's durable effect: route it into the harness. This is
+// the part that must not be overtaken by a later /stop (model routing
+// takes seconds, and an abort that lands before the submission is placed
+// marks nothing).
+async function placePrompt(route, message) {
   const conversation = await ensureConversation(route);
   await ensureWatcher(conversation.id);
   // Edit/delete events resolve through this index; write it before the run
@@ -1015,37 +1022,85 @@ async function promptRoute(route, message) {
   // Only the current turn's posts are deleted on a later edit.
   await beginTailPosts(conversation.id);
   const content = await ingestUploads(route, message);
-  // Thinking indicator: an eyes reaction while the run is live, removed
-  // when the reply posts (streams and DMs both).
-  await zulip.addReaction(message.id, "eyes").catch(() => {});
+  const doc = await harness.snapshot(ZulipDoc, conversation.id, context);
+  await applyAutoModel(conversation, doc, content);
+  const submission = await conversation.submit(
+    {
+      type: "input",
+      content,
+      requestId: `zulip:${message.id}`,
+      whenBusy: "followUp",
+    },
+    context
+  );
+  return { conversation, content, submission, requestId: `zulip:${message.id}` };
+}
+
+// Wait for a placed prompt's run and post its reply. Runs settle outside
+// the conversation's order gate: a long run never blocks the next message.
+async function settlePrompt(route, placed, message) {
+  const { conversation, submission, requestId } = placed;
+  const settled = await submission.wait(context);
+  log.info(`settled: ${JSON.stringify(settled).slice(0, 400)}`);
+  // A late edit: this run's turn was overridden while we were between
+  // settling and posting — the re-run owns the reply now.
+  if (await isSuperseded(conversation.id, requestId)) {
+    log.info(`turn for message ${message.id} superseded by an edit; reply skipped`);
+    return;
+  }
+  const answer = await extractAnswer(conversation, settled);
+  if (!answer) return; // aborted: silent
+  const reply =
+    answer.length > REPLY_CHAR_LIMIT
+      ? `${answer.slice(0, REPLY_CHAR_LIMIT)}\n\n*(truncated — the full text is in the workspace)*`
+      : answer;
+  await recordTailPost(conversation.id, await route.reply(reply));
+  log.info(`reply posted (${reply.length} chars) -> ${route.conversationKey}`);
+}
+
+// One durable effect at a time per conversation, in delivery order: a
+// /stop must land after the message it is meant to stop. Handlers for
+// different conversations still run concurrently (the poll-loop fix).
+const orderGates = new Map();
+function inOrder(conversationKey, effect) {
+  const prev = orderGates.get(conversationKey) ?? Promise.resolve();
+  const gate = prev.then(effect);
+  const link = gate.catch(() => {}); // a failed effect never blocks the chain
+  orderGates.set(conversationKey, link);
+  link.then(() => {
+    if (orderGates.get(conversationKey) === link) orderGates.delete(conversationKey);
+  });
+  return gate;
+}
+
+// Dispatch one message inside its conversation's order gate. The gate
+// covers the durable effect (a command, or placing a prompt); waiting for
+// the run and posting its reply happen after, so the gate stays short.
+async function dispatchConversation(route, content, message) {
+  let placed = null;
   try {
-    const doc = await harness.snapshot(ZulipDoc, conversation.id, context);
-    await applyAutoModel(conversation, doc, content);
-    const submission = await conversation.submit(
-      {
-        type: "input",
-        content,
-        requestId: `zulip:${message.id}`,
-        whenBusy: "followUp",
-      },
-      context
-    );
-    const settled = await submission.wait(context);
-    log.info(`settled: ${JSON.stringify(settled).slice(0, 400)}`);
-    // A late edit: this run's turn was overridden while we were between
-    // settling and posting — the re-run owns the reply now.
-    if (await isSuperseded(conversation.id, `zulip:${message.id}`)) {
-      log.info(`turn for message ${message.id} superseded by an edit; reply skipped`);
-      return;
-    }
-    const answer = await extractAnswer(conversation, settled);
-    if (!answer) return; // aborted: silent
-    const reply =
-      answer.length > REPLY_CHAR_LIMIT
-        ? `${answer.slice(0, REPLY_CHAR_LIMIT)}\n\n*(truncated — the full text is in the workspace)*`
-        : answer;
-    await recordTailPost(conversation.id, await route.reply(reply));
-    log.info(`reply posted (${reply.length} chars) -> ${route.conversationKey}`);
+    placed = await inOrder(route.conversationKey, async () => {
+      if (content.startsWith("/")) {
+        const handled = await handleCommand(route, content);
+        if (handled) return null;
+      }
+      // Thinking indicator: an eyes reaction while the run is live,
+      // removed when the reply posts (streams and DMs both).
+      await zulip.addReaction(message.id, "eyes").catch(() => {});
+      return placePrompt(route, message);
+    });
+  } catch (err) {
+    log.error(`handling ${route.conversationKey} failed: ${err.message}`);
+    await zulip.removeReaction(message.id, "eyes").catch(() => {});
+    route.reply(`Gateway error: ${err.message}`).catch(() => {});
+    return;
+  }
+  if (!placed) return;
+  try {
+    await settlePrompt(route, placed, message);
+  } catch (err) {
+    log.error(`settling ${route.conversationKey} failed: ${err.message}`);
+    route.reply(`Gateway error: ${err.message}`).catch(() => {});
   } finally {
     await zulip.removeReaction(message.id, "eyes").catch(() => {});
   }
@@ -1257,11 +1312,7 @@ async function onStreamMessage(message) {
     log.info(
       `message from ${message.sender_full_name} in ${stream}/${topic}: ${content.slice(0, 100)}`
     );
-    if (content.startsWith("/")) {
-      const handled = await handleCommand(route, content);
-      if (handled) return;
-    }
-    await promptRoute(route, message);
+    await dispatchConversation(route, content, message);
   } catch (err) {
     log.error(`handling message in ${stream}/${topic} failed: ${err.message}`);
     route
@@ -1280,11 +1331,7 @@ async function onDmMessage(message) {
     );
     // One workspace per DM group, provisioned on first contact.
     await provisionStream(env, route.channel, log);
-    if (content.startsWith("/")) {
-      const handled = await handleCommand(route, content);
-      if (handled) return;
-    }
-    await promptRoute(route, message);
+    await dispatchConversation(route, content, message);
   } catch (err) {
     log.error(`handling direct message ${route.conversationKey} failed: ${err.message}`);
     route.reply(`Gateway error: ${err.message}`).catch(() => {});
