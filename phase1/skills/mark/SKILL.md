@@ -20,23 +20,25 @@ into the chat instead.
 
 There is no browser on this machine and the preview runs on the host.
 The `mark` command registers the doc with the preview server and prints
-a URL; **always post that URL in your reply** — it is the deliverable.
-Example:
+a URL. **Always post that URL in your reply as a clickable link** — it is
+the deliverable. The link text is the document's first `# ` heading (its
+h1 title), not the URL or the file path; if the document has no h1, use
+the file name instead. Keep the URL exactly as printed, including the
+`#ct=` fragment — without it the reader can comment but the comments
+will not save. Example, for a memo titled `# Migration plan`:
 
-```text
-$ mark docs/memos/proposal.md
-http://100.x.y.z:31622/viewer/opt/family-agent/workspaces/<channel>/docs/memos/proposal.md#ct=<token>
+```markdown
+[Migration plan](http://100.x.y.z:31622/viewer/opt/family-agent/workspaces/<channel>/docs/memos/proposal.md#ct=<token>)
 ```
 
-Post the URL exactly as printed, including the `#ct=` fragment: without
-it the reader can comment but the comments will not save. Only readers
-on the tailnet (the owner's devices) can open the URL.
+Only readers on the tailnet (the owner's devices) can open the URL.
 
 A typical round-trip:
 
 ```text
 User:   Write up the migration plan in docs/memos/migration.md and open a preview.
-Agent:  [writes the doc, runs `mark docs/memos/migration.md`, posts the URL]
+Agent:  [writes the doc, runs `mark docs/memos/migration.md`, posts the link
+         [Migration plan](<url>)]
 User:   [reads the preview, clicks two paragraphs, leaves comments, then:]
         Address my comments.
 Agent:  [reads docs/memos/migration.md.comments.md, edits the doc, deletes the
