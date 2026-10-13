@@ -286,6 +286,20 @@ See open question 3 — docker-zulip on the gateway box is the documented path. 
 
 ## Running log
 
+**2026-10-13 — read tool fixed in exec containers; deploy-reset race; model
+quirk.** Three findings from one #meta episode ("editing and forking"):
+(1) the `read` tool had never worked in exec containers —
+`DockerExecutionEnv` lacked `openBinaryReader`; it now drives pi-durable's
+own `LineScanner` (copied into the container at runtime, so semantics track
+the installed version; vector-tested including byte-order marks). (2) Two
+concurrent #meta threads saw a file appear and vanish because a deploy
+reset the workspace clone between them — documented semantics, but the
+agents' AGENTS.md now says push promptly after each commit, not at task
+end. (3) The small model (GLM-5.3-flash) can repeatedly omit an optional
+tool argument (read's `offset`) while its own reasoning claims it sent it —
+confirmed from the durable store's tool-call records. Not a plumbing bug;
+a data point for the escalation policy.
+
 **2026-10-12 — mark (markdown preview) on the box, tailnet-only.** The mark
 skill is now available to every agent: `mark <file.md>` registers the doc
 with a preview server installed on the box and prints a tailnet URL, which
