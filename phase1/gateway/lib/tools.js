@@ -216,7 +216,7 @@ const historySearchTool = defineTool({
 // ---------------------------------------------------------------------------
 // Threads: fork this conversation, or spawn a fresh subagent thread.
 
-export function buildZulipTools({ onThreadCreated, onPushChanges }) {
+export function buildZulipTools({ onThreadCreated, onPushChanges, onUpload }) {
   const spawnThreadTool = defineTool({
     name: "spawn_thread",
     description:
@@ -309,6 +309,51 @@ export function buildZulipTools({ onThreadCreated, onPushChanges }) {
     },
   });
 
+  // Hand a file to the user: the gateway reads the path from the
+  // channel's workspace mount (a path outside it is refused), uploads it
+  // to Zulip with the bot's credentials, and returns a shareable link.
+  // Sessions hold no Zulip credentials, so only the gateway side can
+  // actually move bytes out of the workspace.
+  const uploadFileTool = defineTool({
+    name: "upload_file",
+    description:
+      "Upload a file from the workspace to Zulip and return a download link, so you can hand a file to the user (a PDF, image, data export, anything too big to paste). Use it whenever the user should receive a file that lives in the workspace, then include the returned markdown link in your reply.",
+    parameters: Type.Object({
+      path: Type.String({ description: "Workspace-relative path of the file, e.g. notes/report.pdf" }),
+    }),
+    replay: "safe",
+    async execute(args, api, context) {
+      const mine = await api.snapshot(ZulipDoc, api.conversationId, context);
+      if (!mine?.stream) {
+        return { content: [{ type: "text", text: "No channel mapping for this conversation." }] };
+      }
+      if (!onUpload) {
+        return { content: [{ type: "text", text: "upload_file is not available in this channel." }] };
+      }
+      let result;
+      try {
+        result = await onUpload(mine.stream, args.path);
+      } catch (err) {
+        return { content: [{ type: "text", text: `Upload failed: ${err.message}` }] };
+      }
+      const sizeText =
+        result.size < 1024 * 1024
+          ? `${Math.max(1, Math.round(result.size / 1024))} KB`
+          : `${(result.size / 1024 / 1024).toFixed(1)} MB`;
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              `Uploaded ${result.name} (${sizeText}). Share it in your reply with this markdown link ` +
+              `(Zulip renders it as a file link the user can open or download):\n\n` +
+              `[${result.name}](${result.url})`,
+          },
+        ],
+      };
+    },
+  });
+
   // The meta channel's push: the gateway runs git push with a deploy key
   // that lives only on the gateway side, so agents can trigger a push but
   // never read the key.
@@ -339,6 +384,7 @@ export function buildZulipTools({ onThreadCreated, onPushChanges }) {
       spawnThreadTool,
       forkThreadTool,
       pushChangesTool,
+      uploadFileTool,
     ],
   });
 }

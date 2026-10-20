@@ -11,7 +11,7 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { Harness } from "@earendil-works/pi-durable";
@@ -187,6 +187,35 @@ async function ensureExecContainer(conversationId, stream) {
   return name;
 }
 
+// ---------------------------------------------------------------------------
+// File hand-off: upload a workspace file to Zulip's user_uploads so the
+// user can download it from chat. The gateway reads the file from its
+// workspace mount; agents only ever pass a workspace-relative path.
+
+const MAX_UPLOAD_BYTES = 64 * 1024 * 1024;
+
+async function uploadWorkspaceFile(stream, relativePath) {
+  const ws = workspaceDir(env, stream);
+  const abs = path.resolve(ws, String(relativePath));
+  if (abs !== ws && !abs.startsWith(ws + path.sep)) {
+    throw new Error("path must stay inside the channel's workspace");
+  }
+  const info = await stat(abs).catch(() => {
+    throw new Error(`not found in the workspace: ${relativePath}`);
+  });
+  if (!info.isFile()) throw new Error(`not a regular file: ${relativePath}`);
+  if (info.size > MAX_UPLOAD_BYTES) {
+    throw new Error(
+      `file is ${(info.size / 1024 / 1024).toFixed(1)} MB; the upload cap is ` +
+        `${MAX_UPLOAD_BYTES / 1024 / 1024} MB (the org's own limit may be lower)`
+    );
+  }
+  const bytes = await readFile(abs);
+  const url = await zulip.uploadFile(bytes, path.basename(abs));
+  audit.record("upload", { stream, path: String(relativePath).slice(0, 200), size: info.size });
+  return { url, name: path.basename(abs), size: info.size };
+}
+
 /**
  * The meta channel's git push. The deploy key lives in SECRETS_DIR, which is
  * mounted only into the gateway and these one-off push containers — never
@@ -261,6 +290,7 @@ const ZulipTools = buildZulipTools({
     if (mapping.task) void runSpawnedThread(conversationId, mapping);
   },
   onPushChanges: pushWorkspaceToOrigin,
+  onUpload: uploadWorkspaceFile,
 });
 
 const registry = createRegistry();

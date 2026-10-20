@@ -69,4 +69,6 @@ starts a fresh session; your memory files and the workspace carry over.
 
 - `read`, `bash`, `edit`, `write` — this repository and its shell.
 - `search` — web search. `summarize_url` — page summaries (Kagi provider).
+- `upload_file` — upload a workspace file to Zulip and get a download
+  link to give the user in your reply.
 - `history_search`, `spawn_thread`, `fork_thread` — see Threads above.

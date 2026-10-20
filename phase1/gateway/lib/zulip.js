@@ -223,6 +223,31 @@ export class Zulip {
     });
   }
 
+  /**
+   * Upload a file into the realm's user_uploads area (multipart POST).
+   * Returns the full download URL to embed in a message as
+   * `[filename](url)` — Zulip renders that as a file link any org
+   * member can open. Size is capped by the org's upload limit.
+   */
+  async uploadFile(bytes, filename) {
+    const form = new FormData();
+    form.append("file", new Blob([bytes]), filename);
+    const res = await this.fetch(new URL("user_uploads", `${this.site}/api/v1/`), {
+      method: "POST",
+      headers: { Authorization: this.auth },
+      body: form,
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok || body.result !== "success") {
+      const err = new Error(
+        `Zulip user_uploads ${res.status}: ${body.msg || res.statusText}`
+      );
+      err.status = res.status;
+      throw err;
+    }
+    return new URL(body.uri, this.site).toString();
+  }
+
   /** Fetch an uploaded file (user_uploads) with the bot's credentials. */
   async downloadFile(urlPath) {
     const res = await this.fetch(new URL(urlPath, this.site), {

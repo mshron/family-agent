@@ -18,6 +18,7 @@ export const STANDARD_TOOLS = [
   "history_search",
   "spawn_thread",
   "fork_thread",
+  "upload_file",
 ];
 
 export class ChannelConfig {

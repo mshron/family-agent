@@ -40,6 +40,11 @@ The Zulip bot is the existing "Nanobot" bot user, on the private stream
   task, replies there) and `fork_thread` (new topic carrying this
   conversation's full history). Both post a header so you can see where
   the thread came from.
+- **`upload_file`.** The agent hands a workspace file to the user: the
+  gateway uploads it to Zulip's `user_uploads` area with the bot's
+  credentials and returns a link the agent embeds in its reply. Paths are
+  resolved against the channel's workspace and must stay inside it;
+  sessions never see Zulip credentials.
 - **`history_search`.** Channel-scoped search over past conversations
   (all topics, including pre-`/new` ones), with topic names in results.
 - **Direct messages.** A DM to the bot is one continuous conversation per
