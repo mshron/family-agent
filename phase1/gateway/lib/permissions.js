@@ -31,8 +31,26 @@
 import { ToolTask, defineExtension, hook } from "@earendil-works/pi-durable";
 import { ZulipDoc } from "./docs.js";
 
-const APPROVE_EMOJI = new Set(["check_mark", "thumbs_up"]);
-const DENY_EMOJI = new Set(["cross_mark", "thumbs_down"]);
+// Approve/deny reactions are matched by unicode codepoint (emoji_code,
+// stable across Zulip versions) with names as a fallback. Names drift by
+// server version: this org names U+2705 "check" and U+1F44D "+1"
+// (captured from live approval reactions on 13 and 20 Oct), while the
+// first ship matched only "check_mark"/"thumbs_up" — so every real
+// approval expired unanswered. Both paths require reaction_type
+// "unicode_emoji": realm emoji reuse codepoints as ids and may carry
+// decision-shaped names.
+const APPROVE_CODES = new Set(["2705"]); // ✅
+const APPROVE_EMOJI = new Set(["check", "check_mark", "white_check_mark", "+1", "thumbs_up"]);
+const DENY_CODES = new Set(["274c"]); // ❌
+const DENY_EMOJI = new Set(["x", "cross_mark", "-1", "thumbs_down"]);
+
+/** One reaction event -> "approve" | "deny" | null (null = not a decision). */
+function reactionWants(event) {
+  if (event.reaction_type !== "unicode_emoji") return null;
+  if (APPROVE_EMOJI.has(event.emoji_name) || APPROVE_CODES.has(event.emoji_code)) return "approve";
+  if (DENY_EMOJI.has(event.emoji_name) || DENY_CODES.has(event.emoji_code)) return "deny";
+  return null;
+}
 
 /** "git push*" -> /^git push.*$/s. `*` is the only wildcard. */
 export function patternToRegExp(pattern) {
@@ -160,12 +178,19 @@ export function buildPermissionsExtension({
     const waiters = pending.get(event.message_id);
     if (!waiters || waiters.size === 0) return false;
     const entry = [...waiters][0];
-    const wants = APPROVE_EMOJI.has(event.emoji_name)
-      ? "approve"
-      : DENY_EMOJI.has(event.emoji_name)
-        ? "deny"
-        : null;
-    if (!wants) return false;
+    const wants = reactionWants(event);
+    if (!wants) {
+      // A reaction landed on a pending ask but decides nothing. Keep it
+      // visible in the audit: the 13-20 Oct approvals died exactly here,
+      // silently, because the emoji names were guessed instead of captured.
+      audit?.record("tool", {
+        decision: "unmatched-reaction",
+        by: `user:${event.user_id}`,
+        emoji: `${event.emoji_name ?? "?"} (${event.emoji_code ?? "?"})`,
+        messageId: event.message_id,
+      });
+      return false;
+    }
     const email = await isOwner(event.user_id);
     if (!email) {
       // Fail closed toward unknown users, but keep the ask alive: the real

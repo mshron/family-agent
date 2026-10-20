@@ -286,6 +286,19 @@ See open question 3 — docker-zulip on the gateway box is the documented path. 
 
 ## Running log
 
+**2026-10-20 — push approvals expired silently: the emoji names were
+guessed, not captured.** Every `push_changes` ask since Phase 2 shipped
+expired unanswered while the owner reacted ✅ in the topic. Cause: the
+approve set matched `check_mark`/`thumbs_up`, but live Zulip names U+2705
+"check" and U+1F44D "+1" — every real approval reaction fell through the
+matcher with no audit line, so a week of broken approvals left no trace.
+Fixes: match by codepoint (`emoji_code`, stable) with names as fallback,
+both gated on `unicode_emoji`; audit reactions that land on pending asks
+without deciding them; and the contract/smoke fixtures now carry captured
+live events. The tests had stayed green all week against the same wrong
+guess. Lesson: fixtures for external event shapes come from captured
+traffic, never from names read back out of your own code.
+
 **2026-10-13 — /stop fixed: ordering gates + abort signal.** The "stop
 test" thread caught a real race: message handlers run fire-and-forget
 (the poll-loop fix), and a prompt's placement spends seconds in model

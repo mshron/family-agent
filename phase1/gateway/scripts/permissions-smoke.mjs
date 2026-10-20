@@ -219,7 +219,10 @@ console.log("  ok - allow: the tool ran and the model saw its result");
     op: "add",
     message_id: posted.at(-1).id,
     user_id: 1,
-    emoji_name: "check_mark",
+    // the live event shape: Zulip names U+2705 "check" (captured 20 Oct)
+    emoji_name: "check",
+    emoji_code: "2705",
+    reaction_type: "unicode_emoji",
   });
   assert.equal(await answerPromise, "RAN-SEEN");
   const decisions = auditEvents.filter((e) => e.decision).map((e) => e.decision);

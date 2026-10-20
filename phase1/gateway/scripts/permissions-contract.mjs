@@ -178,17 +178,37 @@ function fakeApi({ stream = "meta", memos } = {}) {
   assert.match(posted[0].content, /needs approval/);
   assert.match(posted[0].content, /Auto-denied/);
   // non-owner approve reaction: ignored, ask stays live
-  const ignored = await p.handleReactionEvent({ op: "add", message_id: posted[0].id, user_id: 5, emoji_name: "check_mark" });
+  // events below carry the fields live Zulip events carry: names and
+  // codepoints captured from the real approval reactions of 13/20 Oct
+  const ignored = await p.handleReactionEvent({
+    op: "add", message_id: posted[0].id, user_id: 5,
+    emoji_name: "check", emoji_code: "2705", reaction_type: "unicode_emoji",
+  });
   assert.equal(ignored, false);
   assert.equal(p.pendingCount(), 1);
   // wrong emoji: ignored
-  const ignored2 = await p.handleReactionEvent({ op: "add", message_id: posted[0].id, user_id: OWNER_ID, emoji_name: "eyes" });
+  const ignored2 = await p.handleReactionEvent({
+    op: "add", message_id: posted[0].id, user_id: OWNER_ID,
+    emoji_name: "eyes", emoji_code: "1f440", reaction_type: "unicode_emoji",
+  });
   assert.equal(ignored2, false);
   // reaction removal: ignored
-  const ignored3 = await p.handleReactionEvent({ op: "remove", message_id: posted[0].id, user_id: OWNER_ID, emoji_name: "check_mark" });
+  const ignored3 = await p.handleReactionEvent({
+    op: "remove", message_id: posted[0].id, user_id: OWNER_ID,
+    emoji_name: "check", emoji_code: "2705", reaction_type: "unicode_emoji",
+  });
   assert.equal(ignored3, false);
-  // owner approves
-  const resolved = await p.handleReactionEvent({ op: "add", message_id: posted[0].id, user_id: OWNER_ID, emoji_name: "check_mark" });
+  // a realm emoji cannot approve, even one whose id is a codepoint
+  const realm = await p.handleReactionEvent({
+    op: "add", message_id: posted[0].id, user_id: OWNER_ID,
+    emoji_name: "check", emoji_code: "2705", reaction_type: "realm_emoji",
+  });
+  assert.equal(realm, false);
+  // owner approves: the live event shape, name "check", codepoint 2705
+  const resolved = await p.handleReactionEvent({
+    op: "add", message_id: posted[0].id, user_id: OWNER_ID,
+    emoji_name: "check", emoji_code: "2705", reaction_type: "unicode_emoji",
+  });
   assert.equal(resolved, true);
   assert.equal(p.pendingCount(), 0);
   assert.equal(await decision, undefined); // allowed
@@ -198,6 +218,7 @@ function fakeApi({ stream = "meta", memos } = {}) {
   assert.equal(kinds.includes("ask"), true);
   assert.equal(kinds.includes("approved"), true);
   assert.equal(kinds.includes("ignored-reaction"), true);
+  assert.equal(kinds.includes("unmatched-reaction"), true);
   ok("ask: approve path with owner check, wrong-emoji and non-owner ignored");
 }
 
@@ -210,10 +231,30 @@ function fakeApi({ stream = "meta", memos } = {}) {
     {}
   );
   await new Promise((r) => setTimeout(r, 5));
-  await p.handleReactionEvent({ op: "add", message_id: posted.at(-1).id, user_id: OWNER_ID, emoji_name: "cross_mark" });
+  await p.handleReactionEvent({
+    op: "add", message_id: posted.at(-1).id, user_id: OWNER_ID,
+    emoji_name: "x", emoji_code: "274c", reaction_type: "unicode_emoji",
+  });
   const result = await decision;
   assert.match(result.block, /denied/);
   ok("ask: deny path blocks the call");
+}
+
+{
+  // ask rule: "+1" (the owner approval reaction of 13 Oct) approves too
+  const p = build();
+  const decision = p.extension.hooks[0].handlers.beforeTool(
+    { id: "c4b", name: "push_changes", arguments: {} },
+    fakeApi(),
+    {}
+  );
+  await new Promise((r) => setTimeout(r, 5));
+  await p.handleReactionEvent({
+    op: "add", message_id: posted.at(-1).id, user_id: OWNER_ID,
+    emoji_name: "+1", emoji_code: "1f44d", reaction_type: "unicode_emoji",
+  });
+  assert.equal(await decision, undefined);
+  ok("ask: the +1 reaction approves");
 }
 
 {
@@ -286,7 +327,10 @@ function fakeApi({ stream = "meta", memos } = {}) {
   await new Promise((r) => setTimeout(r, 5));
   assert.equal(posted.length, countAfterFirst);
   // the original ask still resolves both waits
-  await p.handleReactionEvent({ op: "add", message_id: posted.at(-1).id, user_id: OWNER_ID, emoji_name: "check_mark" });
+  await p.handleReactionEvent({
+    op: "add", message_id: posted.at(-1).id, user_id: OWNER_ID,
+    emoji_name: "check", emoji_code: "2705", reaction_type: "unicode_emoji",
+  });
   assert.equal(await d1, undefined);
   assert.equal(await d2, undefined);
   ok("ask: a rerun reuses the memoed approval message and one reaction resolves it");
