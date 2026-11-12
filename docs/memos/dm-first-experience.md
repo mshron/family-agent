@@ -95,6 +95,12 @@ The build order's steps 1–4 shipped in one gateway change (the skills loop, st
 
 Verified by `node --check` over every touched file and the extended contract script (20 checks; path rules, dm tool fallback, dm permission fallback, people entries) plus the permissions smoke run. The .docx walkthrough and the live work-stream flows (auto-creation, sync wait, background report, consolidation) need the box: they are the deploy's acceptance tests.
 
+First live run (12 Nov, the .docx citation job) found three gaps, fixed the same day:
+
+8. **No tool spoilers in DM front conversations.** The front conversation probed the .doc with bash before delegating, and every probe — including `[error] Command exited with code 1` harness blocks — posted as a spoiler into the DM. Tool output belongs to the task topic; the person's thread carries words only. Task topics keep their spoilers (that is the watch-the-work surface). The instruction set now also says: delegate first, investigate never.
+9. **Work stream names come from the person's real full name.** The org hides emails (`user1031086@zulipchat.com`), and the migrated person doc had `name: null`, so the slug fell back to the obfuscated local part and produced `user1031086-work`. Boot migration now fetches `full_name` by user id (always visible), backfills existing null-name persons, and renames a mis-derived work stream (Zulip stream rename; every task conversation's doc moves with it, old topic keys are dropped, the poller re-registers).
+10. **Sync tasks acknowledge at once.** The front conversation is blocked while `run_task` waits, so a nine-minute job started with silence. The gateway now posts "▶️ On it — task … running in #<work stream>" when a sync task starts (rate-limited with the other proactive posts).
+
 ## Sources reviewed
 
 - `phase1/gateway/`: gateway.js (DM routing, ask resolution, approval integrity), lib/tools.js (spawn_thread/fork_thread), lib/naming.js (topic auto-naming), lib/sections.js (memory, skills listing), lib/provision.js (workspace skeleton).

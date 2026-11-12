@@ -305,6 +305,21 @@ const ZulipTools = buildZulipTools({
     ensureWatcher(conversationId).catch((err) =>
       log.error(`watcher for ${conversationId} failed: ${err.message}`)
     );
+    // A sync task started from a DM: acknowledge at once — the front
+    // conversation is blocked on the answer and would otherwise stay silent
+    // for the whole run (the 12 Nov review: "Great, I'm on it" first).
+    if (mapping.kind === "task" && mapping.fromDm && !mapping.task) {
+      const route = dmRouteForChannel(mapping.fromDm);
+      if (route && allowProactive(mapping.fromDm)) {
+        zulip
+          .sendPrivateMessage(
+            route.replyRecipients,
+            `▶️ On it — task "${mapping.topic}" is running in #${mapping.stream}. I'll reply here with the result.`
+          )
+          .then((posted) => recordTailPost(byTopic.get(route.conversationKey), posted))
+          .catch((err) => log.warn(`task ack post failed: ${err.message}`));
+      }
+    }
     if (mapping.task) void runSpawnedThread(conversationId, mapping);
   },
   onPushChanges: pushWorkspaceToOrigin,
@@ -505,6 +520,7 @@ const INSTRUCTIONS_DM = [
   "Your final reply text is posted to that thread as-is, so answer directly and completely.",
   "How you work:",
   "- Small requests: handle them yourself with your tools.",
+  "- When a real job arrives, do not investigate it first — call run_task right away with a complete task description. The task conversation does its own investigation, and tool output does not appear in this thread, so this thread shows only your words: keep replies short, human, and about the job.",
   "- Real jobs (document processing, file transformations, multi-step deliverables): call run_task. It starts a task conversation in the person's work stream (visible there as a topic), waits, and returns the result here. Files the person sends land in uploads/ — pass those paths along. Say that you delegated, and where the work is visible.",
   "- run_task with wait=false runs the job in the background; its result arrives here when it finishes.",
   "- Memory lives in memory/ files and loads fresh on every message. When the user says \"remember X\" or \"forget Y\", edit the matching memory file and say what changed. Never put anything in memory the user would not want kept.",
@@ -696,6 +712,9 @@ function argSummary(toolName, args) {
 async function postSpoiler(conversationId, toolName, args, resultText) {
   const mapping = byId.get(conversationId);
   if (!mapping) return;
+  // DM front conversations stay human-readable (dm-first review): tool
+  // output belongs in the task topic, not in the person's thread.
+  if (mapping.recipients) return;
   if (watchers.get(conversationId)?.quiet) return; // gateway-initiated passes
   const header = `${toolName} — ${argSummary(toolName, args)}`.slice(0, 80);
   const body = (resultText || "(no output)").slice(0, SPOILER_RESULT_LIMIT);
@@ -2131,9 +2150,23 @@ setInterval(async () => {
 
 // ---------------------------------------------------------------------------
 
-/** DM conversations created before this deploy: backfill the person
- *  field, and bring tool list and instructions up to the current
- *  front-conversation configuration (they are fixed at creation). */
+/** Fetch a user's full name; null when the lookup fails (the org may hide
+ *  emails, but full_name is always visible — the live 12 Nov case where the
+ *  person email was user1031086@… and the stream came out "user1031086-work"). */
+async function personFullName(userId) {
+  try {
+    const body = await zulip.getUser(userId);
+    const name = body?.user?.full_name;
+    return typeof name === "string" && name.trim() ? name.trim() : null;
+  } catch {
+    return null;
+  }
+}
+
+/** DM conversations created before this deploy: backfill the person field
+ *  (with the real full name), and bring tool list and instructions up to
+ *  the current front-conversation configuration (they are fixed at
+ *  creation). */
 async function migrateDmDocs() {
   for (const [key, conversationId] of [...byTopic.entries()]) {
     if (!key.startsWith("dm::")) continue;
@@ -2142,12 +2175,28 @@ async function migrateDmDocs() {
     if (!doc.person) {
       const idMatch = /^dm-(\d+)$/.exec(doc.stream);
       const others = (doc.recipients || []).filter((e) => e !== botEmail);
-      if (idMatch && others.length === 1) {
-        const person = { id: Number(idMatch[1]), email: others[0], name: null };
+      if (!idMatch || others.length !== 1) continue;
+      const person = {
+        id: Number(idMatch[1]),
+        email: others[0],
+        name: await personFullName(Number(idMatch[1])),
+      };
+      await harness.commit(async (tx) => {
+        (await tx.doc(ZulipDoc, conversationId)).person = person;
+      }, context);
+      log.info(
+        `person backfilled for ${doc.stream}: ${person.email} (${person.name ?? "name unknown"})`
+      );
+    } else if (!doc.person.name) {
+      // Backfilled before the name fix (obfuscated email, null name): a
+      // null-name person slug is what named a work stream "user…-work".
+      const name = await personFullName(doc.person.id);
+      if (name) {
         await harness.commit(async (tx) => {
-          (await tx.doc(ZulipDoc, conversationId)).person = person;
+          const d = await tx.doc(ZulipDoc, conversationId);
+          d.person = { ...d.person, name };
         }, context);
-        log.info(`person backfilled for ${doc.stream}: ${person.email}`);
+        log.info(`person name backfilled for ${doc.stream}: ${name}`);
       }
     }
     const conversation = await harness.conversation(conversationId, context);
@@ -2160,6 +2209,61 @@ async function migrateDmDocs() {
   }
 }
 
+/** Rename a person's work stream from an old auto-derived name to the
+ *  current one, moving every task conversation's mapping with it. No-op
+ *  when the Zulip stream is gone or the rename is refused (a collision). */
+async function renameWorkStream(oldName, newName, dmChannel) {
+  try {
+    const stream = await zulip.getStreamByName(oldName);
+    if (!stream) return false;
+    await zulip.renameStream(stream.stream_id, newName);
+  } catch (err) {
+    log.warn(`work stream rename ${oldName} -> ${newName} refused: ${err.message}`);
+    return false;
+  }
+  for (const [tid, m] of [...byId.entries()]) {
+    if (m.stream !== oldName) continue;
+    await harness.commit(async (tx) => {
+      (await tx.doc(ZulipDoc, tid)).stream = newName;
+    }, context);
+    for (const [k] of [...byTopic.entries()]) {
+      if (k.startsWith(`${oldName}::`)) byTopic.delete(k);
+    }
+    registerConversation(tid, { stream: newName, topic: m.topic });
+  }
+  workStreamToWorkspace.set(
+    newName,
+    workStreamToWorkspace.get(oldName) ?? dmChannel
+  );
+  workStreamToWorkspace.delete(oldName);
+  stopStreamQueue(oldName);
+  startStreamQueue(newName);
+  audit.record("workstream-rename", { from: oldName, to: newName, person: dmChannel });
+  log.info(`work stream renamed: ${oldName} -> ${newName}`);
+  return true;
+}
+
+/** One-time boot pass: when the person's name was unknown at first
+ *  derivation (the obfuscated-email case), the work stream came out as
+ *  "user<id>-work". Rename it to "<name>-work" now that the name is known. */
+async function migrateWorkStreamNames() {
+  for (const [key, conversationId] of [...byTopic.entries()]) {
+    if (!key.startsWith("dm::")) continue;
+    const dmChannel = key.slice(5);
+    const doc = await harness.snapshot(ZulipDoc, conversationId, context);
+    if (!doc?.person) continue;
+    const desired = await workStreamForPerson(doc.person);
+    if (!desired) continue;
+    for (const [tid, m] of [...byId.entries()]) {
+      if (m.recipients || !m.stream?.endsWith("-work") || m.stream === desired) continue;
+      const tdoc = await harness.snapshot(ZulipDoc, tid, context);
+      if (tdoc?.origin?.taskFrom !== doc.stream) continue; // not this person's
+      const renamed = await renameWorkStream(m.stream, desired, dmChannel);
+      if (!renamed) break;
+    }
+  }
+}
+
 /** Boot pass: register every person's work stream -> its DM workspace, so
  *  task conversations share the person's files across restarts. */
 async function resolvePersonStreams() {
@@ -2169,6 +2273,15 @@ async function resolvePersonStreams() {
     if (!doc?.person) continue;
     const stream = await workStreamForPerson(doc.person);
     if (stream) workStreamToWorkspace.set(stream, doc.stream);
+    // Task conversations created under an older stream name keep sharing
+    // the person's workspace even before (or without) a rename.
+    for (const [tid, m] of [...byId.entries()]) {
+      if (m.recipients || !m.stream?.endsWith("-work")) continue;
+      const tdoc = await harness.snapshot(ZulipDoc, tid, context);
+      if (tdoc?.origin?.taskFrom === doc.stream) {
+        workStreamToWorkspace.set(m.stream, doc.stream);
+      }
+    }
   }
   if (workStreamToWorkspace.size > 0) {
     log.info(`work streams: ${[...workStreamToWorkspace.entries()].map(([s, w]) => `${s} -> ${w}`).join(", ")}`);
@@ -2184,6 +2297,7 @@ async function main() {
   await cacheOwnerIds();
   await migrateDmDocs();
   await resolvePersonStreams();
+  await migrateWorkStreamNames();
   if (env.ZULIP_OWNER_EMAILS.length > 0 && ownerIds.size === 0) {
     log.warn(
       "no owner ids resolved: permission asks will post but can never be approved " +

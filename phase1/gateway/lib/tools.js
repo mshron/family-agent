@@ -266,7 +266,7 @@ export function buildZulipTools({
       const header =
         `*(task for ${mine.person?.name ?? mine.person?.email ?? "the user"}, ` +
         `delegated from the direct-message thread — task: ${String(args.task).slice(0, 150)})*`;
-      const mapping = { kind: "task", stream, topic, header };
+      const mapping = { kind: "task", stream, topic, header, fromDm: mine.stream };
       // tx.createConversation only takes ownership; the agent (model,
       // instructions, tools) is set with configure() and the doc in the same
       // commit — the pattern spawn_thread already uses. Runs on the caller's

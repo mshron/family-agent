@@ -44,6 +44,18 @@ export class Zulip {
     return this._call("GET", "users/me");
   }
 
+  /** Look up one stream by name: { stream_id, name } | null when absent. */
+  getStreamByName(streamName) {
+    return this._call("GET", "streams", { stream: [streamName] }).then(
+      (body) => body?.streams?.[0] ?? null
+    );
+  }
+
+  /** Rename a stream (topics and subscribers carry over). */
+  renameStream(streamId, newName) {
+    return this._call("PATCH", `streams/${streamId}`, { name: newName });
+  }
+
   /**
    * Subscribe the bot to a stream. A stream name that does not exist yet is
    * auto-created; the top-level invite_only makes that stream private.
