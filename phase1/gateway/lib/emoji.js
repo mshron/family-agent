@@ -36,9 +36,12 @@ const CANDIDATES = {
 
 /** The OpenRouter origin, derived from the shared LLM base URL. models.js
  *  treats LLM_BASE_URL as the /api/v1 root (or the proxy's /llm root);
- *  the Decisions API lives at /api/alpha/decisions on the same origin. */
+ *  the Decisions API lives at /api/alpha/decisions on the same origin —
+ *  its own /decisions route on the proxy, since the /llm route maps to
+ *  /api/v1 upstream and cannot carry /api/alpha. */
 export function decisionsUrl(baseUrl = process.env.LLM_BASE_URL) {
   let base = baseUrl || "https://openrouter.ai/api/v1";
+  if (base.endsWith("/llm")) return `${base.slice(0, -"/llm".length)}/decisions`;
   if (base.endsWith("/api/v1")) base = base.slice(0, -"/api/v1".length);
   return `${base}/api/alpha/decisions`;
 }

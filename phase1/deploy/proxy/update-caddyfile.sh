@@ -30,5 +30,8 @@ done
 if [ "$changed" = 1 ]; then
   [ -f "$DIR/update-caddyfile.sh" ] && install -m 755 "$DIR/update-caddyfile.sh" /usr/local/bin/update-caddyfile.sh
   cd /opt/family-agent && docker compose -f phase1/deploy/proxy/compose.yml up -d --build
+  # compose does not notice mounted-file content changes: restart Caddy so
+  # a new Caddyfile is actually loaded.
+  docker compose -f phase1/deploy/proxy/compose.yml restart proxy
 fi
 exit 0

@@ -38,6 +38,17 @@
 		}
 	}
 
+	# The Decisions API (Jev, emoji picks): /api/alpha, not /api/v1 —
+	# its own route, same injected key.
+	handle /decisions {
+		rewrite * /api/alpha/decisions
+		reverse_proxy https://openrouter.ai {
+			header_up Host openrouter.ai
+			header_up Authorization "Bearer {env.OPENROUTER_API_KEY}"
+			header_down -Server
+		}
+	}
+
 	handle_path /kagi/* {
 		rewrite * /api/v2{uri}
 		reverse_proxy https://kagi.com {
