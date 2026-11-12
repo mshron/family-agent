@@ -11,7 +11,7 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { Harness } from "@earendil-works/pi-durable";
@@ -326,6 +326,8 @@ const ZulipTools = buildZulipTools({
   onUpload: uploadWorkspaceFile,
   resolveWorkStream: resolveWorkStreamForDoc,
   onTaskAgent: taskAgentFor,
+  onSaveSkill,
+  onTaskLedger: appendTaskLedger,
   uniqueTopicFor: uniqueTopic,
 });
 
@@ -351,6 +353,9 @@ const permissions = buildPermissionsExtension({
   audit,
   askTimeoutMs: env.ASK_TIMEOUT_MS,
   isOwner,
+  // Per-person permission profile (dm-first memo, step 5): the person
+  // whose conversation produced an ask may resolve it themselves.
+  mayResolve: personMayResolve,
   post: async (conversationId, content) => {
     const mapping = byId.get(conversationId);
     if (!mapping) throw new Error(`no topic mapping for conversation ${conversationId}`);
@@ -513,6 +518,8 @@ const INSTRUCTIONS = [
   "Follow the workspace conventions in the conventions section: notes in notes/, writeups in docs/,",
   "durable facts in memory/ (say in your reply when you change memory).",
   "history_search finds past conversations in this channel; spawn_thread and fork_thread create new topics.",
+  "When you finish a job and learn a better way to do this kind of work, call save_skill with the method;",
+  "the person approves it in chat, and future task conversations load it.",
 ].join(" ");
 
 const INSTRUCTIONS_DM = [
@@ -523,6 +530,8 @@ const INSTRUCTIONS_DM = [
   "- When a real job arrives, do not investigate it first — call run_task right away with a complete task description. The task conversation does its own investigation, and tool output does not appear in this thread, so this thread shows only your words: keep replies short, human, and about the job.",
   "- Real jobs (document processing, file transformations, multi-step deliverables): call run_task. It starts a task conversation in the person's work stream (visible there as a topic), waits, and returns the result here. Files the person sends land in uploads/ — pass those paths along. Say that you delegated, and where the work is visible.",
   "- run_task with wait=false runs the job in the background; its result arrives here when it finishes.",
+  "- Every delegated job is recorded in the task ledger (tasks.md in the workspace); the /tasks command and the nightly consolidation read it.",
+  "- When the same kind of job repeats, or the person gives durable feedback on how work should be done, call save_skill to keep the method as a skill (it asks for approval first). Future task conversations load saved skills.",
   "- Memory lives in memory/ files and loads fresh on every message. When the user says \"remember X\" or \"forget Y\", edit the matching memory file and say what changed. Never put anything in memory the user would not want kept.",
   "- Some turns are scheduled passes (marked as such): propose memory edits in your reply, and apply them only after the user agrees.",
   "history_search finds past conversations in direct messages; there are no topics here, so spawn_thread and fork_thread do not apply.",
@@ -574,6 +583,32 @@ async function ensureConversation(route) {
   });
   log.info(`conversation created for ${route.conversationKey}: ${created.id}`);
   return created;
+}
+
+/** The person whose conversation this is: a DM front conversation carries
+ *  the person directly; a task conversation carries origin.taskFrom, the
+ *  DM channel key of the person who delegated. */
+async function personForConversation(conversationId) {
+  const doc = await harness.snapshot(ZulipDoc, conversationId, context).catch(() => null);
+  if (!doc) return null;
+  if (doc.person) return doc.person;
+  if (doc.origin?.taskFrom) {
+    const dmId = byTopic.get(`dm::${doc.origin.taskFrom}`);
+    if (dmId) {
+      const dmDoc = await harness.snapshot(ZulipDoc, dmId, context).catch(() => null);
+      return dmDoc?.person ?? null;
+    }
+  }
+  return null;
+}
+
+/** May this user resolve an ask born in this conversation? The person
+ *  whose front conversation (or delegated task) it is may always resolve;
+ *  owners resolve everything (checked before this runs). */
+async function personMayResolve(userId, conversationId) {
+  const person = await personForConversation(conversationId);
+  if (person && Number(userId) === person.id) return person.name || person.email;
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -640,17 +675,138 @@ async function resolveWorkStreamForDoc(doc) {
 
 /** The agent a task conversation starts with: the work stream's tool list,
  *  the strong model only when the front conversation pinned it. */
-function taskAgentFor(stream, mode) {
+function taskAgentFor(stream, mode, person) {
   const strong = mode === "strong";
+  // Per-person wording (dm-first memo, step 5): task instructions name
+  // the person the task serves, falling back to the stream default.
+  const instructions = person
+    ? INSTRUCTIONS.replace(
+        "You are Max's personal assistant.",
+        `You are the personal assistant for ${person.name ?? person.email}.`
+      )
+    : INSTRUCTIONS;
   return {
     model: MODEL_ALIASES[strong ? "strong" : "flash"],
     thinkingLevel: strong ? "high" : "low",
-    instructions: INSTRUCTIONS,
+    instructions,
     tools: channelConfig
       .toolsFor(stream)
       .map((name) => toolByName.get(name))
       .filter(Boolean),
   };
+}
+
+// ---------------------------------------------------------------------------
+// Skills loop (dm-first memo, step 5). Skills are prompt content, so the
+// exec containers mount them read-only: writing is gateway-only, and every
+// write lands as a git commit in the skills tree — the same tamper-evidence
+// shape as the memory gate. A DM front conversation saves into the person's
+// work stream (where task conversations load skills); a task or stream
+// conversation saves into its own stream.
+
+function skillSlug(name) {
+  return String(name)
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 64) || "skill";
+}
+
+function gitRun(args) {
+  return new Promise((resolve) => {
+    const child = spawn("git", args, { cwd: env.SKILLS_DIR, stdio: ["ignore", "pipe", "pipe"] });
+    let out = "";
+    child.stdout.on("data", (c) => (out += c.toString()));
+    child.stderr.on("data", (c) => (out += c.toString()));
+    child.on("exit", (code) => resolve({ code, out }));
+    child.on("error", (e) => resolve({ code: -1, out: String(e) }));
+  });
+}
+
+async function saveSkillToStream(stream, { name, description, instructions, mode }) {
+  await mkdir(path.join(env.SKILLS_DIR, stream), { recursive: true });
+  // The skills tree is one git repo: init once, commit every change.
+  if (!existsSync(path.join(env.SKILLS_DIR, ".git"))) {
+    let r = await gitRun(["init", "-q"]);
+    if (r.code !== 0) throw new Error(`git init failed in skills dir: ${r.out.slice(0, 200)}`);
+    r = await gitRun(["-c", "user.name=family-agent gateway", "-c", "user.email=gateway@family-agent.local", "commit", "--allow-empty", "-qm", "skills repo init"]);
+    // An empty-commit failure is non-fatal; the next real save commits.
+  }
+  const slug = skillSlug(name);
+  const dir = path.join(env.SKILLS_DIR, stream, slug);
+  const file = path.join(dir, "SKILL.md");
+  if (mode === "save" && existsSync(file)) {
+    throw new Error(`a skill named "${slug}" already exists in ${stream}; use update_skill to change it`);
+  }
+  if (mode === "update" && !existsSync(file)) {
+    throw new Error(`no skill named "${slug}" exists in ${stream}; use save_skill to create it`);
+  }
+  await mkdir(dir, { recursive: true });
+  // An update without a new description keeps the old one (the description
+  // is what future agents see when deciding to load the skill).
+  let descriptionText = String(description || "").trim();
+  if (!descriptionText && mode === "update") {
+    const old = await readFile(file, "utf8").catch(() => "");
+    descriptionText = /^description: ?(.*)$/m.exec(old)?.[1] ?? "";
+  }
+  if (!descriptionText) descriptionText = `${slug} skill.`;
+  const body =
+    `---\nname: ${slug}\ndescription: ${descriptionText.replace(/\n/g, " ").slice(0, 500)}\n---\n\n` +
+    String(instructions).trim() +
+    "\n";
+  await writeFile(file, body);
+  let r = await gitRun(["add", "-A"]);
+  if (r.code !== 0) throw new Error(`git add failed: ${r.out.slice(0, 200)}`);
+  r = await gitRun([
+    "-c", "user.name=family-agent gateway",
+    "-c", "user.email=gateway@family-agent.local",
+    "commit", "-qm", `${mode === "save" ? "new" : "update"} skill ${stream}/${slug}`,
+  ]);
+  if (r.code !== 0) throw new Error(`git commit failed: ${r.out.slice(0, 200)}`);
+  audit.record("skill", { stream, skill: slug, mode });
+  log.info(`skill ${mode}d: ${stream}/${slug}`);
+  return { slug, dir: `${stream}/${slug}` };
+}
+
+/** Where a conversation's skills live: the person's work stream from a DM
+ *  front conversation (task conversations load skills there), else the
+ *  conversation's own stream. */
+async function skillsChannelForDoc(doc) {
+  if (doc?.recipients && doc.person) {
+    const stream = await workStreamForPerson(doc.person);
+    if (stream) return stream;
+    return {
+      error:
+        `No work stream is configured for ${doc.person.email}, so skills saved from the direct-message ` +
+        `thread would have nowhere to load. Add a "people" entry in channels.json, or send the skill ` +
+        `request from a task topic.`,
+    };
+  }
+  return doc?.stream ?? null;
+}
+
+async function onSaveSkill(conversationId, args) {
+  const doc = await harness.snapshot(ZulipDoc, conversationId, context).catch(() => null);
+  if (!doc?.stream) throw new Error("no channel mapping for this conversation");
+  const target = await skillsChannelForDoc(doc);
+  if (!target || typeof target === "object") throw new Error(target?.error || "no skills directory for this conversation");
+  return saveSkillToStream(target, args);
+}
+
+// ---------------------------------------------------------------------------
+// Task ledger (dm-first memo, step 5): one grep-able file per person,
+// tasks.md in their shared workspace. run_task appends; /tasks and the
+// consolidation pass read.
+
+async function appendTaskLedger(stream, text) {
+  const ws = workspaceChannelOf(stream);
+  if (!ws) return;
+  const dir = workspaceDir(env, ws);
+  await mkdir(dir, { recursive: true });
+  const file = path.join(dir, "tasks.md");
+  const stamp = new Date().toISOString().replace(/\.\d+Z$/, "Z");
+  await appendFile(file, `- ${stamp} ${text}\n`);
 }
 
 // ---------------------------------------------------------------------------
@@ -1308,7 +1464,8 @@ async function runSpawnedThread(conversationId, mapping) {
     // notice, and let the DM report say the task failed (the person who
     // started it should know).
     let reportText = answer;
-    if (looksLikeProviderError(answer)) {
+    const failed = looksLikeProviderError(answer);
+    if (failed) {
       log.error(`provider error as thread reply (${mapping.stream}::${mapping.topic}): ${answer.slice(0, 300)}`);
       audit.record("provider-error", { channel: mapping.stream, text: answer.slice(0, 300) });
       reportText = MODEL_FAILED_NOTICE;
@@ -1318,6 +1475,15 @@ async function runSpawnedThread(conversationId, mapping) {
       await zulip.sendStreamMessage(mapping.stream, mapping.topic, reportText)
     );
     log.info(`thread reply posted (${reportText.length} chars) -> ${mapping.stream}::${mapping.topic}`);
+    // The ledger records the outcome (dm-first memo, step 5) — even when
+    // the proactive DM report is rate-limited away. Only for delegated
+    // tasks (kind "task"); ordinary spawned threads keep out of the ledger.
+    if (mapping.kind === "task")
+    await appendTaskLedger(
+      mapping.stream,
+      `${failed ? "failed" : "finished"} "${mapping.topic}"` +
+        ` — ${failed ? "model service error" : reportText.slice(0, 120).replace(/\n/g, " ")}`
+    ).catch(() => {});
     // A background task delegated from a DM reports back there (dm-first
     // memo: fire-and-forget results arrive as proactive messages).
     if (mapping.notify?.dmChannel && allowProactive(mapping.notify.dmChannel)) {
@@ -1639,6 +1805,20 @@ async function handleCommand(route, content) {
       return true;
     }
     case "tasks": {
+      // The task ledger (dm-first memo, step 5): tasks.md in the person's
+      // shared workspace, appended by run_task. Show its tail; the older
+      // topic scan covers workspaces without a ledger yet.
+      const ledgerPath = path.join(
+        workspaceDir(env, workspaceChannelOf(route.channel)),
+        "tasks.md"
+      );
+      const ledger = await readFile(ledgerPath, "utf8").catch(() => null);
+      if (ledger && ledger.trim()) {
+        const lines = ledger.trim().split("\n");
+        await say(`**Task ledger** (tasks.md, newest last):
+\`\`\`\n${lines.slice(-25).join("\n")}\n\`\``);
+        return true;
+      }
       // Which stream's topics to list: the person's work stream in a DM,
       // this stream's own topics otherwise.
       let stream = route.kind === "dm" ? null : route.stream;
@@ -1650,7 +1830,7 @@ async function handleCommand(route, content) {
         stream = doc?.person ? await workStreamForPerson(doc.person) : null;
       }
       if (!stream) {
-        await say("No work stream for this conversation yet — delegate a job first.");
+        await say("No tasks recorded yet — delegate a job first.");
         return true;
       }
       const prefix = `${stream}::`;

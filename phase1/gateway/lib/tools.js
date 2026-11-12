@@ -229,6 +229,8 @@ export function buildZulipTools({
   onUpload,
   resolveWorkStream,
   onTaskAgent,
+  onSaveSkill,
+  onTaskLedger,
   uniqueTopicFor,
 }) {
   const err = (text) => ({ content: [{ type: "text", text }] });
@@ -273,7 +275,7 @@ export function buildZulipTools({
       // tx; never nests commits.
       const createChild = async (tx, ownership) => {
         const record = await tx.createConversation({ ownership });
-        await configure(tx, record.id, onTaskAgent(stream, mine.model));
+        await configure(tx, record.id, onTaskAgent(stream, mine.model, mine.person));
         const doc = await tx.doc(ZulipDoc, record.id);
         doc.stream = stream;
         doc.topic = topic;
@@ -281,6 +283,15 @@ export function buildZulipTools({
         doc.model = "auto";
         return record.id;
       };
+
+      const ledger = async (text) => {
+        try {
+          await onTaskLedger?.(stream, text);
+        } catch {
+          /* the ledger is a side record; never fail the task for it */
+        }
+      };
+      await ledger(`started "${topic}" (${args.wait === false ? "background" : "sync"}) → #${stream}`);
 
       if (args.wait !== false) {
         // Sync: the child belongs to this tool call's task. The ownership
@@ -301,6 +312,7 @@ export function buildZulipTools({
         );
         const settled = await submission.wait(context);
         if (settled.status !== "done") {
+          await ledger(`aborted "${topic}" — ${settled.status}`);
           return err(
             `The task "${topic}" did not finish (${settled.status}` +
               `${settled.reason ? ": " + settled.reason : ""}). Tell the user what happened.`
@@ -320,11 +332,15 @@ export function buildZulipTools({
         // 5xx wrapped in a completed message); the raw text must not be
         // relayed into the person's thread.
         if (PROVIDER_ERROR_RE.test(answer.slice(0, 200))) {
+          await ledger(`failed "${topic}" — model service error`);
           return err(
             `Task "${topic}" hit a model-service error and did not complete. ` +
             `Tell the user it failed, and offer to run it again.`
           );
         }
+        await ledger(
+          `finished "${topic}" — ${answer.slice(0, 120).replace(/\n/g, " ") || "done"}`
+        );
         return {
           content: [
             {
@@ -520,6 +536,55 @@ export function buildZulipTools({
     },
   });
 
+  // Skills loop (dm-first memo, step 5). Skills are prompt content: the
+  // exec containers mount the skills tree read-only, so writing happens
+  // gateway-side (git-committed, ask-gated by the permission layer). A
+  // front conversation saves into the person's work stream, where task
+  // conversations load skills; a task or stream conversation saves into
+  // its own stream.
+  const skillResult = (mode, r) =>
+    `Skill ${mode === "save" ? "saved" : "updated"}: ${r.dir}. Future task conversations in that stream load it automatically when the description matches. Tell the user what you kept and why.`;
+  const saveSkillTool = defineTool({
+    name: "save_skill",
+    description:
+      "Save a skill: a reusable, step-by-step method for a kind of job, stored as a skill that future task conversations load automatically. Use it when a job reveals a repeatable method (a workflow, a file format, a recurring deliverable) or when the person gives durable feedback on how work should be done. Requires the person's approval in chat. Name it after the kind of job (e.g. 'apa-citation-fixes'); instructions are the complete method, written for an agent that knows nothing else.",
+    parameters: Type.Object({
+      name: Type.String({ description: "Short skill name, kebab-case (e.g. 'docx-citation-fixes')" }),
+      description: Type.String({ description: "One sentence: what the skill does and when to use it — this is what future agents see when deciding to load it" }),
+      instructions: Type.String({ description: "The complete method as markdown: steps, commands, file paths, conventions. Written for an agent in a fresh task conversation." }),
+    }),
+    replay: "safe",
+    async execute(args, api, context) {
+      if (!onSaveSkill) return err("save_skill is not available in this channel.");
+      try {
+        const r = await onSaveSkill(api.conversationId, { ...args, mode: "save" });
+        return { content: [{ type: "text", text: skillResult("save", r) }] };
+      } catch (e) {
+        return err(`save_skill failed: ${e.message}`);
+      }
+    },
+  });
+  const updateSkillTool = defineTool({
+    name: "update_skill",
+    description:
+      "Update the instructions of an existing skill (from feedback or a changed method). Requires the person's approval in chat. Keep the description accurate; instructions replace the old ones entirely.",
+    parameters: Type.Object({
+      name: Type.String({ description: "The existing skill's name" }),
+      instructions: Type.String({ description: "The complete updated method as markdown (replaces the old instructions)" }),
+      description: Type.Optional(Type.String({ description: "New one-sentence description (unchanged if omitted)" })),
+    }),
+    replay: "safe",
+    async execute(args, api, context) {
+      if (!onSaveSkill) return err("update_skill is not available in this channel.");
+      try {
+        const r = await onSaveSkill(api.conversationId, { ...args, mode: "update" });
+        return { content: [{ type: "text", text: skillResult("update", r) }] };
+      } catch (e) {
+        return err(`update_skill failed: ${e.message}`);
+      }
+    },
+  });
+
   return defineExtension({
     name: "zulip",
     tools: [
@@ -531,6 +596,8 @@ export function buildZulipTools({
       forkThreadTool,
       pushChangesTool,
       uploadFileTool,
+      saveSkillTool,
+      updateSkillTool,
     ],
   });
 }

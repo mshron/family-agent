@@ -19,6 +19,8 @@ export const STANDARD_TOOLS = [
   "spawn_thread",
   "fork_thread",
   "upload_file",
+  "save_skill",
+  "update_skill",
 ];
 
 export class ChannelConfig {

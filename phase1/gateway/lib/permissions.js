@@ -160,6 +160,11 @@ export class PermissionRules {
  *   noteDecision(conversationId, text) -> posts the outcome note (best effort)
  *   describe(channel, call) -> extra context for the ask message ("" ok)
  *   isOwner(userId)        -> owner email string | null (null = not an owner)
+ *   mayResolve(userId, conversationId) -> who the reactor is for the ask's
+ *       conversation, or null. Owners may resolve any ask (isOwner); a
+ *       person may resolve asks from their own front conversation and
+ *       their work stream's task conversations (the dm-first memo's
+ *       per-person permission profile). Absent -> owners only, as before.
  */
 export function buildPermissionsExtension({
   rulesFor,
@@ -168,6 +173,7 @@ export function buildPermissionsExtension({
   noteDecision,
   describe,
   isOwner,
+  mayResolve,
   askTimeoutMs = 20 * 60_000,
 }) {
   /** approval message id -> Set of waiters (a restart-rerun shares the id) */
@@ -231,10 +237,15 @@ export function buildPermissionsExtension({
       });
       return false;
     }
-    const email = await isOwner(event.user_id);
+    // Who may resolve this ask: the person whose conversation produced it
+    // (dm-first memo), and always the owners. Unknown reactors fail closed,
+    // but the ask stays live for a real decider.
+    let email = await isOwner(event.user_id);
+    if (!email && mayResolve) {
+      const who = await mayResolve(event.user_id, entry.conversationId);
+      if (who) email = who;
+    }
     if (!email) {
-      // Fail closed toward unknown users, but keep the ask alive: the real
-      // owner can still react.
       audit?.record("tool", {
         decision: "ignored-reaction",
         by: `user:${event.user_id}`,

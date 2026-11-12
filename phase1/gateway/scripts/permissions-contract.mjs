@@ -172,7 +172,11 @@ const rules = new PermissionRules({
     undefined
   );
   assert.equal(config.people["a@example.com"].workStream, "a-work");
-  ok("channel config: dm tool set, dm permission fallback, people entries");
+  // The skills loop (dm-first memo, step 5) ships in every tool set, ask-gated
+  assert.equal(config.toolsFor("dm-1").includes("save_skill"), true);
+  assert.equal(config.toolsFor("scratch").includes("update_skill"), true);
+  assert.equal(config.toolsFor("meta").includes("save_skill"), true);
+  ok("channel config: dm tool set, dm permission fallback, people entries, skills tools");
 }
 
 // --- the ask flow ------------------------------------------------------------
@@ -423,6 +427,64 @@ function fakeApi({ stream = "meta", memos } = {}) {
   assert.equal(out, undefined);
   assert.equal(auditEvents.some((e) => e.kind === "tool_result" && e.error === true), true);
   ok("afterTool audits without altering the result");
+}
+
+// --- per-person resolution (dm-first memo, step 5) --------------------------
+
+{
+  // A person may resolve asks born in their own conversation; a stranger
+  // may not. mayResolve is consulted after isOwner, so owners resolve first.
+  const PERSON_ID = 77;
+  const p = build({
+    mayResolve: async (id, conversationId) =>
+      id === PERSON_ID && conversationId === 42 ? "Wife Name" : null,
+  });
+  const api = fakeApi();
+  const decision = p.extension.hooks[0].handlers.beforeTool(
+    { id: "c9a", name: "push_changes", arguments: {} },
+    api,
+    {}
+  );
+  await new Promise((r) => setTimeout(r, 5));
+  const messageId = posted.at(-1).id;
+  // a stranger's approval changes nothing
+  const stranger = await p.handleReactionEvent({
+    op: "add", message_id: messageId, user_id: 55,
+    emoji_name: "check", emoji_code: "2705", reaction_type: "unicode_emoji",
+  });
+  assert.equal(stranger, false);
+  assert.equal(p.pendingCount(), 1);
+  // the person's approval resolves, credited by name
+  const resolved = await p.handleReactionEvent({
+    op: "add", message_id: messageId, user_id: PERSON_ID,
+    emoji_name: "check", emoji_code: "2705", reaction_type: "unicode_emoji",
+  });
+  assert.equal(resolved, true);
+  assert.equal(await decision, undefined);
+  assert.ok(auditEvents.some((e) => e.decision === "approved" && e.by === "Wife Name"));
+  assert.ok(notes.some((n) => n.includes("approved by Wife Name")));
+  ok("mayResolve: the person approves their own ask; strangers cannot");
+}
+{
+  // The owner resolves by isOwner even when mayResolve declines.
+  const p = build({
+    mayResolve: async () => null,
+  });
+  const api = fakeApi();
+  const decision = p.extension.hooks[0].handlers.beforeTool(
+    { id: "c9b", name: "push_changes", arguments: {} },
+    api,
+    {}
+  );
+  await new Promise((r) => setTimeout(r, 5));
+  const messageId = posted.at(-1).id;
+  const resolved = await p.handleReactionEvent({
+    op: "add", message_id: messageId, user_id: OWNER_ID,
+    emoji_name: "check", emoji_code: "2705", reaction_type: "unicode_emoji",
+  });
+  assert.equal(resolved, true);
+  assert.equal(await decision, undefined);
+  ok("mayResolve: owners still resolve when mayResolve declines");
 }
 
 console.log(`\npermissions contract: ${passed} checks passed`);
