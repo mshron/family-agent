@@ -151,7 +151,7 @@ const rules = new PermissionRules({
   const { ChannelConfig } = await import("../lib/channels.js");
   const config = new ChannelConfig({
     streams: ["scratch", "meta"],
-    permissions: { tools: { email_send: "ask" } },
+    permissions: { tools: { email_send: "ask", browser_pay: "ask" } },
     channels: {
       meta: { add: ["push_changes"] },
       dm: { permissions: { tools: { push_changes: "deny" } } },
@@ -192,7 +192,14 @@ const rules = new PermissionRules({
   assert.equal(rules.classifyTool("email_search").decision, "allow");
   assert.equal(rules.classifyTool("email_get_body").decision, "allow");
   assert.equal(rules.classifyTool("email_send").decision, "ask");
-  ok("channel config: dm tool set, dm permission fallback, people entries, skills and memory ungated, email_send ask-gated");
+  // The vault browser (13 Nov): browsing and card fills are free; the
+  // purchase click is the money action — every one waits for a human.
+  assert.equal(config.toolsFor("dm-1").includes("browser"), true);
+  assert.equal(config.toolsFor("scratch").includes("fill_card"), true);
+  assert.equal(rules.classifyTool("browser").decision, "allow");
+  assert.equal(rules.classifyTool("fill_card").decision, "allow");
+  assert.equal(rules.classifyTool("browser_pay").decision, "ask");
+  ok("channel config: dm tool set, dm permission fallback, people entries, skills and memory ungated, email_send + browser_pay ask-gated");
 }
 
 // --- the ask flow ------------------------------------------------------------

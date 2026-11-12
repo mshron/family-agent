@@ -26,6 +26,16 @@ services:
       - ./gmail-proxy.py:/srv/gmail-proxy.py:ro
     command: ["python3", "/srv/gmail-proxy.py"]
 
+  # The vault browser: the system's ONE browser (agent-browser on
+  # Chromium), per-conversation instances. Card data lives in this
+  # container's environment; fill-card types it, redaction masks it, the
+  # session box never sees it. Reached through Caddy's /browser route.
+  browser:
+    build: ./browser
+    container_name: fa-browser
+    restart: unless-stopped
+    env_file: /opt/family-agent/proxy.env
+
   # Forward proxy for exec-container egress (browser, fetches): the one
   # logged hop all session internet traffic takes. Reached by the
   # session box directly on the private network, firewalled to it.

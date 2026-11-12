@@ -15,15 +15,16 @@ trap 'rm -rf "$tmp"' EXIT
 curl -fsSL "$REPO/archive/$BRANCH.tar.gz" \
   | tar -xz -C "$tmp" --strip-components=1 \
   --wildcards '*/phase1/deploy/proxy/Caddyfile' '*/phase1/deploy/proxy/compose.yml' \
-             '*/phase1/deploy/proxy/gmail-proxy.py' '*/phase1/deploy/proxy/squid.conf'
+             '*/phase1/deploy/proxy/gmail-proxy.py' '*/phase1/deploy/proxy/squid.conf' \
+             '*/phase1/deploy/proxy/browser/Dockerfile' '*/phase1/deploy/proxy/browser/service.js'
 
 changed=0
-for f in Caddyfile compose.yml gmail-proxy.py squid.conf; do
+for f in Caddyfile compose.yml gmail-proxy.py squid.conf browser/Dockerfile browser/service.js; do
   if [ ! -f "$DIR/$f" ] || ! cmp -s "$tmp/phase1/deploy/proxy/$f" "$DIR/$f"; then
     install -m 644 "$tmp/phase1/deploy/proxy/$f" "$DIR/$f"
     echo "updated $f"
     changed=1
   fi
 done
-[ "$changed" = 1 ] && cd /opt/family-agent && docker compose -f phase1/deploy/proxy/compose.yml up -d
+[ "$changed" = 1 ] && cd /opt/family-agent && docker compose -f phase1/deploy/proxy/compose.yml up -d --build
 exit 0

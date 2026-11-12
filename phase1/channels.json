@@ -6,7 +6,8 @@
       "sudo *": "deny"
     },
     "tools": {
-      "email_send": "ask"
+      "email_send": "ask",
+      "browser_pay": "ask"
     }
   },
   "channels": {

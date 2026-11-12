@@ -28,6 +28,9 @@ export const STANDARD_TOOLS = [
   "email_get_headers",
   "email_get_body",
   "email_send",
+  "browser",
+  "fill_card",
+  "browser_pay",
 ];
 
 export class ChannelConfig {

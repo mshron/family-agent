@@ -11,6 +11,7 @@
 #   /brave/*    -> https://api.search.brave.com/res/v1/* (web search)
 #   /fastmail/* -> https://api.fastmail.com/*      (JMAP email; Bearer token here)
 #   /gmail/*    -> gmail-proxy container           (IMAP/SMTP with app password)
+#   /browser/*  -> fa-browser container            (the ONE browser; card fills, redacted)
 # Callers send no Authorization header; the proxy replaces it upstream.
 #
 # Phase 3: open-world responses (fetch, email bodies) get their ingress
@@ -67,6 +68,11 @@
 	# Email: Gmail over IMAP/SMTP via the sidecar service.
 	handle_path /gmail/* {
 		reverse_proxy gmail-proxy:8081
+	}
+
+	# The vault browser service.
+	handle_path /browser/* {
+		reverse_proxy fa-browser:8090
 	}
 
 	respond 404
