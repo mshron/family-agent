@@ -248,6 +248,8 @@ The point of Phase 1 is to learn whether the Zulip↔session interaction and the
 
 Everything Phase 1 skipped arrives here — against a system you already like using, which is the point of the order.
 
+> **Status 12 Nov:** the durable harness, permissions layer, ask gates, and rate limits shipped with the DM-first build. Still open here: the credential proxy (tool credentials must never enter the exec containers or the durable store), proxy-fronted git for workspaces and memory, and key rotation — the Zulip bot key lived in the retired nanobot's environments, so it rotates before anything else. **Sequencing decision (12 Nov):** no new tools — email, search, finance, Garmin — until the credential proxy lands.
+
 - Second box: the gateway box. Move the gateway onto it; give the session box the hardened container profile and the egress rules (gateway box private IP, DNS, package registries).
 - Credential proxy in front of every upstream; the pi provider re-pointed at it; log service recording events via a pi extension.
 - The permission system active with the authorizer judge (Permissions section); asks resolved through the gateway control path; blocks surfaced in a topic.
@@ -277,7 +279,7 @@ Everything Phase 1 skipped arrives here — against a system you already like us
 
 - Destroy the three Fly apps (the nanobot bot has been idle since Phase 3 — use a *new* bot user for the gateway from the start, since two pollers on one Zulip user double-respond).
   - **Done 12 Nov 2026** — after the gateway shipped on the same "Nanobot" bot user, nanobot kept double-responding to DMs: its broken LLM route (502 via litellm) posted a raw provider error as the bot ~13s after each DM. All three apps (`polynumeral-assistant`, `polynumeral-cred-proxy`, `polynumeral-log`) destroyed via flyctl; the volumes went with them, so the old MEMORY.md curation task is moot.
-- Back up and shut down the old chat and code boxes entirely: a final Mongo backup to the existing Hetzner Object Storage bucket, then LibreChat, codeapi, and the boxes themselves go.
+- Old chat box (LibreChat): **deferred 12 Nov 2026** — kept deliberately as a separate interaction model, not a retirement candidate for now. When retirement does happen, the first step is a final Mongo backup to the existing Hetzner Object Storage bucket. The code box is not a retirement item at all — the new system runs on it.
 - Move the log service's history and nanobot's `MEMORY.md` into the new memory repo (a real curation task — read it, keep what is true, discard what is stale).
 - **Verify:** billing shows Fly and the old two boxes gone; backups for logs + all repos exist in Object Storage/git remotes.
 
