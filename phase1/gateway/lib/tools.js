@@ -293,23 +293,38 @@ async function gmailSearch({ after, before, folder, limit, offset }) {
   const stubs = (await res.json()).messages || [];
   const total = stubs.length;
   const page = stubs.slice(offset, offset + limit);
-  const emails = [];
-  for (const stub of page) {
-    const r = await fetch(
-      gmailUrl(`/messages/${stub.id}?format=metadata&metadataHeaders=From&metadataHeaders=Subject&metadataHeaders=Date&metadataHeaders=List-Unsubscribe`),
-      { signal: AbortSignal.timeout(20000) }
-    );
-    if (!r.ok) continue;
-    const msg = await r.json();
-    const from = gmailHeader(msg.payload?.headers, "From") || "";
-    emails.push({
-      message_id: stub.id,
-      sender: from.includes("<") ? from.split("<")[1].split(">")[0] : from,
-      subject: gmailHeader(msg.payload?.headers, "Subject") || "",
-      date: gmailHeader(msg.payload?.headers, "Date") || "",
-      has_list_unsubscribe: Boolean(gmailHeader(msg.payload?.headers, "List-Unsubscribe")),
-    });
-  }
+  // Metadata fetches are the expensive part — one IMAP round trip each
+  // through the sidecar. Concurrent (the old system ran 5 at a time) and
+  // capped per call so a wide merged search stays bounded.
+  const cap = Math.min(page.length, 120);
+  const metaUrl = (id) =>
+    gmailUrl(`/messages/${id}?format=metadata&metadataHeaders=From&metadataHeaders=Subject&metadataHeaders=Date&metadataHeaders=List-Unsubscribe`);
+  const results = new Array(cap).fill(null);
+  let cursor = 0;
+  const worker = async () => {
+    for (;;) {
+      const i = cursor++;
+      if (i >= cap) return;
+      const stub = page[i];
+      try {
+        const r = await fetch(metaUrl(stub.id), { signal: AbortSignal.timeout(20000) });
+        if (!r.ok) continue;
+        const msg = await r.json();
+        const from = gmailHeader(msg.payload?.headers, "From") || "";
+        results[i] = {
+          message_id: stub.id,
+          sender: from.includes("<") ? from.split("<")[1].split(">")[0] : from,
+          subject: gmailHeader(msg.payload?.headers, "Subject") || "",
+          date: gmailHeader(msg.payload?.headers, "Date") || "",
+          has_list_unsubscribe: Boolean(gmailHeader(msg.payload?.headers, "List-Unsubscribe")),
+        };
+      } catch {
+        /* skip this message */
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(6, cap) }, worker));
+  const emails = results.filter(Boolean);
   return { total, emails };
 }
 
