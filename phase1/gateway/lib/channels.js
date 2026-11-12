@@ -23,6 +23,11 @@ export const STANDARD_TOOLS = [
   "update_skill",
   "delete_skill",
   "memory_search",
+  "email_accounts",
+  "email_search",
+  "email_get_headers",
+  "email_get_body",
+  "email_send",
 ];
 
 export class ChannelConfig {

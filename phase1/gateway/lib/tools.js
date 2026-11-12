@@ -1,5 +1,8 @@
 // Model-facing tools beyond the built-ins: web search, channel-scoped
-// history search, and thread creation (fork or fresh subagent thread).
+// history search, thread creation (fork or fresh subagent thread), and
+// email (Fastmail via JMAP, Gmail via the vault IMAP/SMTP sidecar) —
+// ported from the nanobot's MCP server, all credential-free on this side:
+// every call routes through the vault proxy, which holds the keys.
 
 import { Type } from "@earendil-works/pi-ai";
 import {
@@ -84,6 +87,410 @@ async function braveSearch(query, limit) {
     .filter((r) => r.title && r.url)
     .map((r, i) => `${i + 1}. ${r.title}\n   ${r.url}\n   ${(r.description || "").replace(/<[^>]+>/g, "")}`);
 }
+
+// ---------------------------------------------------------------------------
+// Email (dm-first memo Phase 3; ported from the nanobot email tools).
+// Credentials live vault-side only: Fastmail's JMAP token is injected by
+// fa-proxy; Gmail's app password lives in the gmail-proxy container.
+// Read tools run freely; email_send is ask-gated in channels.json — every
+// outbound message waits for a human reaction. There is no delete tool:
+// automated tooling must not be able to destroy mail (the old system's
+// rule, kept).
+
+const EMAIL_ACCOUNTS = (process.env.EMAIL_ACCOUNTS || "fastmail,gmail")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+// Fastmail JMAP client: session discovery + batched method calls, all
+// through the proxy (token injected there). Direct mode (no proxy) needs
+// FASTMAIL_API_TOKEN in this process's env — local runs only.
+const fastmailJmap = (() => {
+  const base = PROXY ? `${PROXY}/fastmail` : "https://api.fastmail.com";
+  let accountId = null;
+  let apiPath = null;
+  const authHeaders = () =>
+    PROXY ? {} : { Authorization: `Bearer ${process.env.FASTMAIL_API_TOKEN || ""}` };
+  async function ensureSession() {
+    if (accountId && apiPath) return;
+    const res = await fetch(`${base}/jmap/session`, {
+      headers: authHeaders(),
+      signal: AbortSignal.timeout(20000),
+    });
+    if (!res.ok) throw new Error(`Fastmail session ${res.status}`);
+    const data = await res.json();
+    accountId = data.primaryAccounts?.["urn:ietf:params:jmap:mail"];
+    if (!accountId) throw new Error("no JMAP mail account in Fastmail session");
+    apiPath = `${base}${new URL(data.apiUrl).pathname}`;
+  }
+  async function call(methodCalls) {
+    await ensureSession();
+    const res = await fetch(apiPath, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...authHeaders() },
+      body: JSON.stringify({
+        using: [
+          "urn:ietf:params:jmap:core",
+          "urn:ietf:params:jmap:mail",
+          "urn:ietf:params:jmap:submission",
+        ],
+        methodCalls: methodCalls.map(([name, args, cid]) => [
+          name,
+          { accountId, ...args },
+          cid,
+        ]),
+      }),
+      signal: AbortSignal.timeout(30000),
+    });
+    if (!res.ok) throw new Error(`Fastmail JMAP ${res.status}: ${(await res.text()).slice(0, 200)}`);
+    const data = await res.json();
+    for (const [name, body] of data.methodResponses) {
+      if (name === "error") throw new Error(`Fastmail JMAP error: ${JSON.stringify(body).slice(0, 200)}`);
+    }
+    return data.methodResponses;
+  }
+  async function mailboxId(folder) {
+    const responses = await call([["Mailbox/get", { properties: ["name"] }, "mb"]]);
+    const mbox = responses[0][1].list.find((m) => m.name.toLowerCase() === folder.toLowerCase());
+    return mbox?.id || null;
+  }
+  return { call, mailboxId };
+})();
+
+async function fastmailSearch({ after, before, folder, limit, offset }) {
+  const mailboxId = await fastmailJmap.mailboxId(folder);
+  if (!mailboxId) return { total: 0, emails: [] };
+  const responses = await fastmailJmap.call([
+    [
+      "Email/query",
+      {
+        filter: {
+          inMailbox: mailboxId,
+          after: `${after}T00:00:00Z`,
+          before: `${before}T00:00:00Z`,
+        },
+        sort: [{ property: "receivedAt", isAscending: false }],
+        limit,
+        position: offset,
+      },
+      "q",
+    ],
+    [
+      "Email/get",
+      {
+        "#ids": { resultOf: "q", name: "Email/query", path: "/ids" },
+        properties: ["id", "from", "subject", "receivedAt", "header:List-Unsubscribe"],
+      },
+      "g",
+    ],
+  ]);
+  const total = responses[0][1].total ?? 0;
+  const emails = (responses[1][1].list || []).map((e) => ({
+    message_id: e.id,
+    sender: e.from?.[0]?.email || "",
+    subject: e.subject || "",
+    date: e.receivedAt || "",
+    has_list_unsubscribe: Boolean(e["header:List-Unsubscribe"]),
+  }));
+  return { total, emails };
+}
+
+async function fastmailGet(messageId, properties, extra = {}) {
+  const responses = await fastmailJmap.call([["Email/get", { ids: [messageId], properties, ...extra }, "g"]]);
+  return responses[0][1].list?.[0] || null;
+}
+
+async function fastmailSend(to, subject, body) {
+  const responses = await fastmailJmap.call([
+    [
+      "Email/set",
+      {
+        create: {
+          draft1: {
+            to: [{ email: to }],
+            subject,
+            bodyValues: { body: { value: body, charset: "utf-8" } },
+            textBody: [{ partId: "body", type: "text/plain" }],
+            mailboxIds: {},
+          },
+        },
+      },
+      "s",
+    ],
+    [
+      "EmailSubmission/set",
+      {
+        create: {
+          sub1: {
+            emailId: "#draft1",
+            envelope: { mailFrom: { email: "" }, rcptTo: [{ email: to }] },
+          },
+        },
+        onSuccessDestroyEmail: ["#sub1"],
+      },
+      "t",
+    ],
+  ]);
+  if (responses[0][1].notCreated) throw new Error(`Fastmail draft failed: ${JSON.stringify(responses[0][1].notCreated)}`);
+  if (responses[1][1].notCreated) throw new Error(`Fastmail submit failed: ${JSON.stringify(responses[1][1].notCreated)}`);
+  return "sent";
+}
+
+// Gmail: REST-shaped calls served by the vault IMAP/SMTP sidecar (the
+// sidecar emulates the Gmail REST API over IMAP with the app password).
+// There is no direct mode — the sidecar holds the credential.
+const gmailUrl = (path) => `${PROXY}/gmail/gmail/v1/users/me${path}`;
+
+const GMAIL_LABELS = {
+  inbox: "INBOX",
+  sent: "SENT",
+  drafts: "DRAFT",
+  trash: "TRASH",
+  spam: "SPAM",
+  starred: "STARRED",
+  important: "IMPORTANT",
+  unread: "UNREAD",
+};
+
+function gmailHeader(headers, name) {
+  const h = (headers || []).find((h) => h.name.toLowerCase() === name.toLowerCase());
+  return h?.value ?? null;
+}
+
+async function gmailSearch({ after, before, folder, limit, offset }) {
+  if (!PROXY) throw new Error("gmail requires the vault proxy (SEARCH_PROXY_URL)");
+  const ymd = (iso) => iso.replace(/-/g, "/");
+  const params = new URLSearchParams({
+    q: `after:${ymd(after)} before:${ymd(before)}`,
+    labelIds: GMAIL_LABELS[folder.toLowerCase()] || folder,
+    maxResults: "500",
+  });
+  const res = await fetch(gmailUrl(`/messages?${params}`), {
+    signal: AbortSignal.timeout(30000),
+  });
+  if (!res.ok) throw new Error(`Gmail list ${res.status}: ${(await res.text()).slice(0, 200)}`);
+  const stubs = (await res.json()).messages || [];
+  const total = stubs.length;
+  const page = stubs.slice(offset, offset + limit);
+  const emails = [];
+  for (const stub of page) {
+    const r = await fetch(
+      gmailUrl(`/messages/${stub.id}?format=metadata&metadataHeaders=From&metadataHeaders=Subject&metadataHeaders=Date&metadataHeaders=List-Unsubscribe`),
+      { signal: AbortSignal.timeout(20000) }
+    );
+    if (!r.ok) continue;
+    const msg = await r.json();
+    const from = gmailHeader(msg.payload?.headers, "From") || "";
+    emails.push({
+      message_id: stub.id,
+      sender: from.includes("<") ? from.split("<")[1].split(">")[0] : from,
+      subject: gmailHeader(msg.payload?.headers, "Subject") || "",
+      date: gmailHeader(msg.payload?.headers, "Date") || "",
+      has_list_unsubscribe: Boolean(gmailHeader(msg.payload?.headers, "List-Unsubscribe")),
+    });
+  }
+  return { total, emails };
+}
+
+async function gmailGet(messageId, format) {
+  if (!PROXY) throw new Error("gmail requires the vault proxy (SEARCH_PROXY_URL)");
+  const res = await fetch(gmailUrl(`/messages/${messageId}?format=${format}`), {
+    signal: AbortSignal.timeout(30000),
+  });
+  if (!res.ok) throw new Error(`Gmail get ${res.status}: ${(await res.text()).slice(0, 200)}`);
+  return res.json();
+}
+
+function gmailExtractBody(payload) {
+  const data = payload?.body?.data;
+  const mime = payload?.mimeType || "";
+  let plain = "";
+  if (data && mime === "text/plain") {
+    plain = Buffer.from(data, "base64url").toString("utf8");
+  }
+  let html = "";
+  for (const part of payload?.parts || []) {
+    const d = part.body?.data;
+    if (d && part.mimeType === "text/html") html = Buffer.from(d, "base64url").toString("utf8");
+    else if (d && part.mimeType === "text/plain" && !plain) plain = Buffer.from(d, "base64url").toString("utf8");
+    else if (part.parts) {
+      const nested = gmailExtractBody(part);
+      if (nested && !html && !plain) html = nested;
+    }
+  }
+  return html || plain;
+}
+
+async function gmailSend(to, subject, body) {
+  if (!PROXY) throw new Error("gmail requires the vault proxy (SEARCH_PROXY_URL)");
+  const mime = [
+    `To: ${to}`,
+    `Subject: ${subject}`,
+    "MIME-Version: 1.0",
+    'Content-Type: text/plain; charset="utf-8"',
+    "",
+    body,
+  ].join("\r\n");
+  const res = await fetch(gmailUrl("/messages/send"), {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ raw: Buffer.from(mime).toString("base64url") }),
+    signal: AbortSignal.timeout(30000),
+  });
+  if (!res.ok) throw new Error(`Gmail send ${res.status}: ${(await res.text()).slice(0, 200)}`);
+  return "sent";
+}
+
+async function emailSearchOn(account, args) {
+  if (account === "fastmail") return fastmailSearch(args);
+  if (account === "gmail") return gmailSearch(args);
+  throw new Error(`unknown account '${account}' (available: ${EMAIL_ACCOUNTS.join(", ")})`);
+}
+
+const emailAccountsTool = defineTool({
+  name: "email_accounts",
+  description: "List the configured email account names. Use these with email_search, email_get_headers, email_get_body, and email_send.",
+  parameters: Type.Object({}),
+  replay: "safe",
+  async execute() {
+    return { content: [{ type: "text", text: JSON.stringify(EMAIL_ACCOUNTS) }] };
+  },
+});
+
+const emailSearchTool = defineTool({
+  name: "email_search",
+  description:
+    'Search email in a date range. Returns sender, subject, date, and whether the message has a List-Unsubscribe header. Examples: email_search(after="2026-11-01") for one account; leave account empty to merge all accounts.',
+  parameters: Type.Object({
+    after: Type.String({ description: 'Start date, ISO "YYYY-MM-DD"' }),
+    before: Type.Optional(Type.String({ description: 'End date, ISO "YYYY-MM-DD". Defaults to today.' })),
+    folder: Type.Optional(Type.String({ description: "Mailbox folder (default Inbox)" })),
+    account: Type.Optional(Type.String({ description: "Account from email_accounts(); empty merges all accounts" })),
+    limit: Type.Optional(Type.Number({ description: "Max results (default 20, max 50)" })),
+    offset: Type.Optional(Type.Number({ description: "Results to skip for pagination (default 0)" })),
+  }),
+  replay: "safe",
+  async execute(args) {
+    const limit = Math.min(Number(args.limit) || 20, 50);
+    const offset = Number(args.offset) || 0;
+    const before = args.before || new Date().toISOString().slice(0, 10);
+    const folder = args.folder || "Inbox";
+    const accounts = args.account ? [args.account] : EMAIL_ACCOUNTS;
+    const merged = [];
+    let total = 0;
+    for (const account of accounts) {
+      const result = await emailSearchOn(account, { after: args.after, before, folder, limit: args.account ? limit : offset + limit, offset: args.account ? offset : 0 });
+      total += result.total;
+      merged.push(...result.emails.map((e) => ({ account, ...e })));
+    }
+    merged.sort((a, b) => String(b.date).localeCompare(String(a.date)));
+    const page = args.account ? merged : merged.slice(offset, offset + limit);
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify({ total, offset: args.account ? offset : offset, limit, emails: page }),
+        },
+      ],
+    };
+  },
+});
+
+const emailHeadersTool = defineTool({
+  name: "email_get_headers",
+  description:
+    "Get key headers (From, Subject, List-Unsubscribe, List-Unsubscribe-Post) for one message — use for unsubscribe workflows.",
+  parameters: Type.Object({
+    account: Type.String({ description: "Account from email_accounts()" }),
+    message_id: Type.String({ description: "Message id from email_search" }),
+  }),
+  replay: "safe",
+  async execute(args) {
+    if (args.account === "fastmail") {
+      const email = await fastmailGet(args.message_id, [
+        "header:List-Unsubscribe",
+        "header:List-Unsubscribe-Post",
+        "header:From",
+        "header:Subject",
+      ]);
+      const headers = {};
+      for (const k of ["List-Unsubscribe", "List-Unsubscribe-Post", "From", "Subject"]) {
+        const v = email?.[`header:${k}`];
+        if (v) headers[k] = v.trim();
+      }
+      return { content: [{ type: "text", text: JSON.stringify(headers, null, 2) }] };
+    }
+    if (args.account === "gmail") {
+      const msg = await gmailGet(args.message_id, "metadata");
+      const headers = {};
+      for (const name of ["List-Unsubscribe", "List-Unsubscribe-Post", "From", "Subject"]) {
+        const v = gmailHeader(msg.payload?.headers, name);
+        if (v) headers[name] = v.trim();
+      }
+      return { content: [{ type: "text", text: JSON.stringify(headers, null, 2) }] };
+    }
+    return { content: [{ type: "text", text: `unknown account '${args.account}'` }] };
+  },
+});
+
+const emailBodyTool = defineTool({
+  name: "email_get_body",
+  description: "Get the body of one message (HTML preferred, plain text fallback).",
+  parameters: Type.Object({
+    account: Type.String({ description: "Account from email_accounts()" }),
+    message_id: Type.String({ description: "Message id from email_search" }),
+  }),
+  replay: "safe",
+  async execute(args) {
+    if (args.account === "fastmail") {
+      const email = await fastmailGet(args.message_id, ["bodyValues", "htmlBody", "textBody"], {
+        fetchHTMLBodyValues: true,
+        fetchTextBodyValues: true,
+      });
+      const values = email?.bodyValues || {};
+      for (const part of email?.htmlBody || []) {
+        if (part.partId && values[part.partId]) {
+          return { content: [{ type: "text", text: values[part.partId].value }] };
+        }
+      }
+      for (const part of email?.textBody || []) {
+        if (part.partId && values[part.partId]) {
+          return { content: [{ type: "text", text: values[part.partId].value }] };
+        }
+      }
+      return err("(empty body)");
+    }
+    if (args.account === "gmail") {
+      const msg = await gmailGet(args.message_id, "full");
+      const body = gmailExtractBody(msg.payload);
+      return { content: [{ type: "text", text: body || "(empty body)" }] };
+    }
+    return { content: [{ type: "text", text: `unknown account '${args.account}'` }] };
+  },
+});
+
+const emailSendTool = defineTool({
+  name: "email_send",
+  description:
+    "Send an email from one of the user's accounts. Requires approval: the ask posts in the conversation and waits for the user's reaction. Use for replies, unsubscribe-by-mailto, and anything the user asks to be sent.",
+  parameters: Type.Object({
+    account: Type.String({ description: "Account from email_accounts()" }),
+    to: Type.String({ description: "Recipient address" }),
+    subject: Type.String({ description: "Subject line" }),
+    body: Type.String({ description: "Body text (plain text)" }),
+  }),
+  replay: "safe",
+  async execute(args) {
+    const result =
+      args.account === "fastmail"
+        ? await fastmailSend(args.to, args.subject, args.body)
+        : args.account === "gmail"
+          ? await gmailSend(args.to, args.subject, args.body)
+          : (() => { throw new Error(`unknown account '${args.account}'`); })();
+    return { content: [{ type: "text", text: `Email sent to ${args.to} ("${args.subject}").` }] };
+  },
+});
+
 
 const searchTool = defineTool({
   name: "search",
@@ -685,6 +1092,11 @@ Read the full file (workspace-relative path) for context around a match.`,
       pushChangesTool,
       uploadFileTool,
       saveSkillTool,
+      emailAccountsTool,
+      emailSearchTool,
+      emailHeadersTool,
+      emailBodyTool,
+      emailSendTool,
       updateSkillTool,
       deleteSkillTool,
       memorySearchTool,

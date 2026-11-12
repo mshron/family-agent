@@ -35,6 +35,7 @@ for ipt in iptables ip6tables; do
   "\$ipt" -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
   "\$ipt" -A INPUT -p tcp --dport 22 -j ACCEPT
   "\$ipt" -A INPUT -p tcp -s $SESSION_BOX_IP --dport 8080 -j ACCEPT
+  "\$ipt" -A INPUT -p tcp -s $SESSION_BOX_IP --dport 3128 -j ACCEPT
   "\$ipt" -A INPUT -p tcp -s $SESSION_BOX_IP --dport 514 -j ACCEPT
   "\$ipt" -P INPUT DROP
 done

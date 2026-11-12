@@ -6,9 +6,11 @@
 # private network only; bootstrap.sh firewalls it to the session box.
 #
 # Routes (prefix stripped, upstream path prepended):
-#   /llm/*   -> https://openrouter.ai/api/v1/*   (LLM_BASE_URL=http://10.0.0.4:8080/llm)
-#   /kagi/*  -> https://kagi.com/api/v2/*        (search + summarize)
-#   /brave/* -> https://api.search.brave.com/res/v1/* (web search)
+#   /llm/*      -> https://openrouter.ai/api/v1/*   (LLM_BASE_URL=http://10.0.0.4:8080/llm)
+#   /kagi/*     -> https://kagi.com/api/v2/*        (search + summarize)
+#   /brave/*    -> https://api.search.brave.com/res/v1/* (web search)
+#   /fastmail/* -> https://api.fastmail.com/*      (JMAP email; Bearer token here)
+#   /gmail/*    -> gmail-proxy container           (IMAP/SMTP with app password)
 # Callers send no Authorization header; the proxy replaces it upstream.
 #
 # Phase 3: open-world responses (fetch, email bodies) get their ingress
@@ -51,6 +53,20 @@
 			header_up X-Subscription-Token {env.BRAVE_API_KEY}
 			header_down -Server
 		}
+	}
+
+	# Email: Fastmail JMAP (token injected here, callers carry none).
+	handle_path /fastmail/* {
+		reverse_proxy https://api.fastmail.com {
+			header_up Host api.fastmail.com
+			header_up Authorization "Bearer {env.FASTMAIL_API_TOKEN}"
+			header_down -Server
+		}
+	}
+
+	# Email: Gmail over IMAP/SMTP via the sidecar service.
+	handle_path /gmail/* {
+		reverse_proxy gmail-proxy:8081
 	}
 
 	respond 404

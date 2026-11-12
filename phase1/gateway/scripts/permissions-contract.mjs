@@ -151,6 +151,7 @@ const rules = new PermissionRules({
   const { ChannelConfig } = await import("../lib/channels.js");
   const config = new ChannelConfig({
     streams: ["scratch", "meta"],
+    permissions: { tools: { email_send: "ask" } },
     channels: {
       meta: { add: ["push_changes"] },
       dm: { permissions: { tools: { push_changes: "deny" } } },
@@ -184,7 +185,14 @@ const rules = new PermissionRules({
   // through memory_search, consent through the reply text.
   assert.equal(rules.classifyPaths("write", "memory/user.md").decision, "allow");
   assert.equal(rules.classifyPaths("edit", "memory/x.md").decision, "allow");
-  ok("channel config: dm tool set, dm permission fallback, people entries, skills and memory ungated");
+  // Email (Phase 3): reads are free, every outbound send waits for a
+  // human — the capability-channel policy from phase2-hardening.md.
+  assert.equal(config.toolsFor("dm-1").includes("email_search"), true);
+  assert.equal(config.toolsFor("scratch").includes("email_send"), true);
+  assert.equal(rules.classifyTool("email_search").decision, "allow");
+  assert.equal(rules.classifyTool("email_get_body").decision, "allow");
+  assert.equal(rules.classifyTool("email_send").decision, "ask");
+  ok("channel config: dm tool set, dm permission fallback, people entries, skills and memory ungated, email_send ask-gated");
 }
 
 // --- the ask flow ------------------------------------------------------------

@@ -4,6 +4,9 @@
     "bash": {
       "rm -rf /*": "deny",
       "sudo *": "deny"
+    },
+    "tools": {
+      "email_send": "ask"
     }
   },
   "channels": {

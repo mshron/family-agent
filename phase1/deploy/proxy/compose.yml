@@ -1,7 +1,5 @@
-# fa-proxy on the vault box (trusted half of the two-box split). Keys live
-# in ./proxy.env (mode 600) on that box alone; nothing else runs there.
-# The port is published on the private-network IP only, and host iptables
-# (bootstrap.sh) restricts it to the session box's private IP.
+# Vault box services (trusted half of the two-box split). Keys live in
+# ./proxy.env (mode 600) on this box alone; the session box holds none.
 services:
   proxy:
     image: caddy:2
@@ -12,3 +10,30 @@ services:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
     ports:
       - "10.0.0.4:8080:8080"
+    depends_on:
+      - gmail-proxy
+
+  # Gmail: REST-compatible HTTP front over IMAP/SMTP with the app
+  # password. Stdlib-only Python; Caddy routes /gmail/* here.
+  gmail-proxy:
+    image: python:3.12-slim
+    container_name: fa-gmail-proxy
+    restart: unless-stopped
+    env_file: /opt/family-agent/proxy.env
+    environment:
+      - BIND_HOST=0.0.0.0
+    volumes:
+      - ./gmail-proxy.py:/srv/gmail-proxy.py:ro
+    command: ["python3", "/srv/gmail-proxy.py"]
+
+  # Forward proxy for exec-container egress (browser, fetches): the one
+  # logged hop all session internet traffic takes. Reached by the
+  # session box directly on the private network, firewalled to it.
+  squid:
+    image: ubuntu/squid:latest
+    container_name: fa-squid
+    restart: unless-stopped
+    volumes:
+      - ./squid.conf:/etc/squid/squid.conf:ro
+    ports:
+      - "10.0.0.4:3128:3128"
