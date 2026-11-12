@@ -22,5 +22,9 @@
     },
     "dm": {}
   },
-  "people": {}
+  "people": {
+    "user1031086@polynumeral.zulipchat.com": {
+      "emailAccounts": ["fastmail", "gmail"]
+    }
+  }
 }
