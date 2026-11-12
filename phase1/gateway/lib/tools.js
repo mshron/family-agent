@@ -102,6 +102,27 @@ const EMAIL_ACCOUNTS = (process.env.EMAIL_ACCOUNTS || "fastmail,gmail")
   .map((s) => s.trim())
   .filter(Boolean);
 
+/** Accounts allowed for this conversation. The gateway injects the
+ *  resolver through buildZulipTools (person-scoped, fail closed); without
+ *  it — local runs and tests — the env default list stands. */
+let emailAccountsResolver = null;
+
+async function allowedAccounts(api) {
+  if (emailAccountsResolver) {
+    return await emailAccountsResolver(api.conversationId);
+  }
+  return EMAIL_ACCOUNTS;
+}
+
+const noAccess = () => ({
+  content: [
+    {
+      type: "text",
+      text: "No email access is configured for this conversation. If this is your own DM, ask the owner to configure accounts for you.",
+    },
+  ],
+});
+
 // Fastmail JMAP client: session discovery + batched method calls, all
 // through the proxy (token injected there). Direct mode (no proxy) needs
 // FASTMAIL_API_TOKEN in this process's env — local runs only.
@@ -349,11 +370,13 @@ async function emailSearchOn(account, args) {
 
 const emailAccountsTool = defineTool({
   name: "email_accounts",
-  description: "List the configured email account names. Use these with email_search, email_get_headers, email_get_body, and email_send.",
+  description: "List the email account names you may use. Use these with email_search, email_get_headers, email_get_body, and email_send.",
   parameters: Type.Object({}),
   replay: "safe",
-  async execute() {
-    return { content: [{ type: "text", text: JSON.stringify(EMAIL_ACCOUNTS) }] };
+  async execute(args, api) {
+    const allowed = await allowedAccounts(api);
+    if (allowed.length === 0) return noAccess();
+    return { content: [{ type: "text", text: JSON.stringify(allowed) }] };
   },
 });
 
@@ -370,12 +393,19 @@ const emailSearchTool = defineTool({
     offset: Type.Optional(Type.Number({ description: "Results to skip for pagination (default 0)" })),
   }),
   replay: "safe",
-  async execute(args) {
+  async execute(args, api) {
+    const allowed = await allowedAccounts(api);
+    if (allowed.length === 0) return noAccess();
+    if (args.account && !allowed.includes(args.account)) {
+      return {
+        content: [{ type: "text", text: `Account '${args.account}' is not available in this conversation (available: ${allowed.join(", ")})` }],
+      };
+    }
     const limit = Math.min(Number(args.limit) || 20, 50);
     const offset = Number(args.offset) || 0;
     const before = args.before || new Date().toISOString().slice(0, 10);
     const folder = args.folder || "Inbox";
-    const accounts = args.account ? [args.account] : EMAIL_ACCOUNTS;
+    const accounts = args.account ? [args.account] : allowed;
     const merged = [];
     let total = 0;
     for (const account of accounts) {
@@ -405,7 +435,9 @@ const emailHeadersTool = defineTool({
     message_id: Type.String({ description: "Message id from email_search" }),
   }),
   replay: "safe",
-  async execute(args) {
+  async execute(args, api) {
+    const allowed = await allowedAccounts(api);
+    if (!allowed.includes(args.account)) return noAccess();
     if (args.account === "fastmail") {
       const email = await fastmailGet(args.message_id, [
         "header:List-Unsubscribe",
@@ -441,7 +473,9 @@ const emailBodyTool = defineTool({
     message_id: Type.String({ description: "Message id from email_search" }),
   }),
   replay: "safe",
-  async execute(args) {
+  async execute(args, api) {
+    const allowed = await allowedAccounts(api);
+    if (!allowed.includes(args.account)) return noAccess();
     if (args.account === "fastmail") {
       const email = await fastmailGet(args.message_id, ["bodyValues", "htmlBody", "textBody"], {
         fetchHTMLBodyValues: true,
@@ -480,7 +514,9 @@ const emailSendTool = defineTool({
     body: Type.String({ description: "Body text (plain text)" }),
   }),
   replay: "safe",
-  async execute(args) {
+  async execute(args, api) {
+    const allowed = await allowedAccounts(api);
+    if (!allowed.includes(args.account)) return noAccess();
     const result =
       args.account === "fastmail"
         ? await fastmailSend(args.to, args.subject, args.body)
@@ -652,9 +688,11 @@ export function buildZulipTools({
   onTaskAgent,
   onSaveSkill,
   onTaskLedger,
+  emailAccountsFor,
   onMemorySearch,
   uniqueTopicFor,
 }) {
+  emailAccountsResolver = emailAccountsFor ?? null;
   const err = (text) => ({ content: [{ type: "text", text }] });
 
   // The DM front conversation's delegation tool (the dm-first memo). It

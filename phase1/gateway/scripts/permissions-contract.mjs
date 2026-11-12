@@ -518,4 +518,34 @@ function fakeApi({ stream = "meta", memos } = {}) {
   ok("ask: no timeout means the ask waits for a reaction");
 }
 
+{
+  // Email scoping (13 Nov): per person, fail closed. Owners default to
+  // the system accounts; a people entry overrides; nobody else — a second
+  // spouse, a shared channel, an unresolved person — gets any account.
+  const { ChannelConfig } = await import("../lib/channels.js");
+  const cfg = new ChannelConfig({
+    streams: ["scratch"],
+    channels: {},
+    people: { "w@example.com": { workStream: "w-work", emailAccounts: ["gmail-w"] } },
+  });
+  assert.deepEqual(cfg.people["w@example.com"].emailAccounts, ["gmail-w"]);
+
+  const { buildZulipTools } = await import("../lib/tools.js");
+  const fakeApi = { conversationId: "c1" };
+  const toolOf = (ext, name) => ext.tools.find((t) => t.name === name);
+  const none = buildZulipTools({ emailAccountsFor: async () => [] });
+  const r1 = await toolOf(none, "email_accounts").execute({}, fakeApi, {});
+  assert.match(r1.content[0].text, /No email access/);
+  const r2 = await toolOf(none, "email_get_body").execute({ account: "fastmail", message_id: "x" }, fakeApi, {});
+  assert.match(r2.content[0].text, /No email access/);
+  const mine = buildZulipTools({ emailAccountsFor: async () => ["fastmail"] });
+  const r3 = await toolOf(mine, "email_search").execute(
+    { after: "2026-11-01", account: "gmail" },
+    fakeApi,
+    {}
+  );
+  assert.match(r3.content[0].text, /not available/);
+  ok("email: person-scoped accounts, fail closed");
+}
+
 console.log(`\npermissions contract: ${passed} checks passed`);

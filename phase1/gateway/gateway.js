@@ -330,6 +330,7 @@ const ZulipTools = buildZulipTools({
   onTaskAgent: taskAgentFor,
   onSaveSkill,
   onTaskLedger: appendTaskLedger,
+  emailAccountsFor: allowedEmailAccountsFor,
   onMemorySearch: searchMemory,
   uniqueTopicFor: uniqueTopic,
 });
@@ -608,6 +609,25 @@ async function personForConversation(conversationId) {
     }
   }
   return null;
+}
+
+/** Which email accounts may this conversation touch? The person's own
+ *  list if their people entry names one; owners default to the system
+ *  accounts; everyone else — no people entry, no person resolved, any
+ *  shared channel — gets nothing. Fail closed: one spouse must never be
+ *  able to read the other's mail, and a task conversation inherits its
+ *  delegating person's scope. */
+async function allowedEmailAccountsFor(conversationId) {
+  const person = await personForConversation(conversationId);
+  const email = person?.email;
+  if (email) {
+    const listed = channelConfig.people[email]?.emailAccounts;
+    if (Array.isArray(listed)) return listed;
+    if (env.ZULIP_OWNER_EMAILS.includes(email)) {
+      return (process.env.EMAIL_ACCOUNTS || "fastmail,gmail").split(",").map((s) => s.trim()).filter(Boolean);
+    }
+  }
+  return [];
 }
 
 /** May this user resolve an ask born in this conversation? The person
