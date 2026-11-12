@@ -16,15 +16,19 @@ curl -fsSL "$REPO/archive/$BRANCH.tar.gz" \
   | tar -xz -C "$tmp" --strip-components=1 \
   --wildcards '*/phase1/deploy/proxy/Caddyfile' '*/phase1/deploy/proxy/compose.yml' \
              '*/phase1/deploy/proxy/gmail-proxy.py' '*/phase1/deploy/proxy/squid.conf' \
-             '*/phase1/deploy/proxy/browser/Dockerfile' '*/phase1/deploy/proxy/browser/service.js'
+             '*/phase1/deploy/proxy/browser/Dockerfile' '*/phase1/deploy/proxy/browser/service.js' \
+             '*/phase1/deploy/proxy/update-caddyfile.sh'
 
 changed=0
-for f in Caddyfile compose.yml gmail-proxy.py squid.conf browser/Dockerfile browser/service.js; do
+for f in Caddyfile compose.yml gmail-proxy.py squid.conf browser/Dockerfile browser/service.js update-caddyfile.sh; do
   if [ ! -f "$DIR/$f" ] || ! cmp -s "$tmp/phase1/deploy/proxy/$f" "$DIR/$f"; then
     install -m 644 "$tmp/phase1/deploy/proxy/$f" "$DIR/$f"
     echo "updated $f"
     changed=1
   fi
 done
-[ "$changed" = 1 ] && cd /opt/family-agent && docker compose -f phase1/deploy/proxy/compose.yml up -d --build
+if [ "$changed" = 1 ]; then
+  [ -f "$DIR/update-caddyfile.sh" ] && install -m 755 "$DIR/update-caddyfile.sh" /usr/local/bin/update-caddyfile.sh
+  cd /opt/family-agent && docker compose -f phase1/deploy/proxy/compose.yml up -d --build
+fi
 exit 0
