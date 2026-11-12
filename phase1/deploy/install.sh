@@ -8,6 +8,10 @@ if [ ! -f .env ]; then
   echo "ERROR: /opt/family-agent/.env is missing (push secrets first)" >&2
   exit 1
 fi
+if [ ! -f proxy.env ]; then
+  echo "ERROR: /opt/family-agent/proxy.env is missing (fa-proxy's keys; see deploy/push-secrets.sh)" >&2
+  exit 1
+fi
 source .env
 
 if ! command -v jq >/dev/null 2>&1; then

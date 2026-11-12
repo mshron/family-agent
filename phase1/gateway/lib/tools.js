@@ -23,17 +23,25 @@ const CONFIG = (() => {
   }
   return {
     provider: process.env.SEARCH_PROVIDER || "brave",
+    proxyUrl: process.env.SEARCH_PROXY_URL || "",
     kagi_key: process.env.KAGI_API_KEY || "",
     brave_key: process.env.BRAVE_API_KEY || "",
   };
 })();
 
+// Credential proxy mode (Phase 2, fa-proxy): keys live proxy-side and
+// callers send no auth headers at all. Direct mode (SEARCH_PROXY_URL
+// unset) keeps keys in the gateway env for local runs and rollback.
+const PROXY = CONFIG.proxyUrl;
+
 async function kagiSearch(query, limit) {
-  const url = new URL("https://kagi.com/api/v2/search");
+  const url = PROXY
+    ? new URL(`${PROXY}/kagi/search`)
+    : new URL("https://kagi.com/api/v2/search");
   url.searchParams.set("q", query);
   url.searchParams.set("limit", String(Math.min(limit, 25)));
   const res = await fetch(url, {
-    headers: { Authorization: `Bot ${CONFIG.kagi_key}` },
+    headers: PROXY ? {} : { Authorization: `Bot ${CONFIG.kagi_key}` },
     signal: AbortSignal.timeout(30000),
   });
   if (!res.ok) throw new Error(`Kagi API ${res.status}: ${(await res.text()).slice(0, 200)}`);
@@ -44,11 +52,13 @@ async function kagiSearch(query, limit) {
 }
 
 async function kagiSummarize(targetUrl) {
-  const url = new URL("https://kagi.com/api/v2/summarize");
+  const url = PROXY
+    ? new URL(`${PROXY}/kagi/summarize`)
+    : new URL("https://kagi.com/api/v2/summarize");
   url.searchParams.set("url", targetUrl);
   url.searchParams.set("summary_engine", "cecil");
   const res = await fetch(url, {
-    headers: { Authorization: `Bot ${CONFIG.kagi_key}` },
+    headers: PROXY ? {} : { Authorization: `Bot ${CONFIG.kagi_key}` },
     signal: AbortSignal.timeout(60000),
   });
   if (!res.ok) throw new Error(`Kagi API ${res.status}`);
@@ -57,11 +67,15 @@ async function kagiSummarize(targetUrl) {
 }
 
 async function braveSearch(query, limit) {
-  const url = new URL("https://api.search.brave.com/res/v1/web/search");
+  const url = PROXY
+    ? new URL(`${PROXY}/brave/web/search`)
+    : new URL("https://api.search.brave.com/res/v1/web/search");
   url.searchParams.set("q", query);
   url.searchParams.set("count", String(Math.min(limit, 20)));
   const res = await fetch(url, {
-    headers: { Accept: "application/json", "X-Subscription-Token": CONFIG.brave_key },
+    headers: PROXY
+      ? { Accept: "application/json" }
+      : { Accept: "application/json", "X-Subscription-Token": CONFIG.brave_key },
     signal: AbortSignal.timeout(30000),
   });
   if (!res.ok) throw new Error(`Brave API ${res.status}: ${(await res.text()).slice(0, 200)}`);
@@ -83,7 +97,7 @@ const searchTool = defineTool({
   async execute(args) {
     const limit = Number(args.limit) || 5;
     const lines =
-      CONFIG.provider === "kagi" && CONFIG.kagi_key
+      CONFIG.provider === "kagi" && (PROXY || CONFIG.kagi_key)
         ? await kagiSearch(args.query, limit)
         : await braveSearch(args.query, limit);
     return {
@@ -105,7 +119,7 @@ const summarizeTool = defineTool({
   parameters: Type.Object({ url: Type.String({ description: "Page URL" }) }),
   replay: "safe",
   async execute(args) {
-    if (!(CONFIG.provider === "kagi" && CONFIG.kagi_key)) {
+    if (!(CONFIG.provider === "kagi" && (PROXY || CONFIG.kagi_key))) {
       return { content: [{ type: "text", text: "summarize_url is available only when the Kagi provider is configured." }] };
     }
     const text = await kagiSummarize(args.url);

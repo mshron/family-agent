@@ -1,6 +1,6 @@
 # Phase 2: what landed, what waits, and the decisions behind it
 
-> **Point of this memo:** Phase 2's software is live: a gateway-native permission layer (deny rules on dangerous bash, an approval gate on `push_changes`) and an append-only audit log. The hardware half — the second box, the credential proxy in front of every upstream, egress lockdown, key rotation — cannot be provisioned from inside the repo, so it ships as reviewed deploy assets plus this runbook. One deviation from the consolidation memo is recorded here: the permission layer is built on pi-durable's own hooks, not on `@gotgenes/pi-permission-system`.
+> **Point of this memo:** Phase 2's software is live: a gateway-native permission layer (deny rules on dangerous bash, an approval gate on `push_changes`), an append-only audit log, and — since 12 Nov, evening — the credential proxy itself, activated single-box. What remains is operator work: egress lockdown and key rotation, both runbooked below. One deviation from the consolidation memo is recorded here: the permission layer is built on pi-durable's own hooks, not on `@gotgenes/pi-permission-system`.
 
 ## What is live now
 
@@ -10,7 +10,7 @@
    - `ask` posts an approval message into the topic (with the pending commits for a push), the owner reacts ✅/❌, and the pending tool call resolves from the reaction event. Approval integrity follows the memo's rule: sessions hold no Zulip credentials and never see reaction events, so an approval cannot be forged from inside a conversation. Only `ZULIP_OWNER_EMAILS` users may approve; unknown reactors fail closed but the ask stays live.
    - Unmatched calls are allowed. Internal errors in classification fail **open** (Phase 1 behavior, loudly audited) — a bug at 3am must not brick every session; failures of the ask flow itself fail **closed** (no approval surface, no consent, no action).
 2. **Audit log** (`gateway/lib/audit.js`). One JSONL line per event at `/opt/family-agent/audit/audit.jsonl`: every tool call's decision and outcome, pushes, slash commands, thread spawns, boot/shutdown, approval decisions with the approver's email. The gateway is the only writer; the directory is never mounted into exec containers, so sessions cannot read it and cannot rewrite what is written.
-3. **LLM proxy seam** (`gateway/lib/models.js`). `LLM_BASE_URL` points every model call at a credential proxy instead of OpenRouter directly. Unset (today): direct, as in Phase 1. Set (after the box split): the proxy holds the real key and this process carries a placeholder.
+3. **LLM proxy seam** (`gateway/lib/models.js`). `LLM_BASE_URL` points every model call at the credential proxy (`fa-proxy`) instead of OpenRouter directly; the proxy holds the real key and this process carries a placeholder. Search goes through the same proxy (`SEARCH_PROXY_URL`), keys living in `/opt/family-agent/proxy.env` only.
 
 ## The deviation: pi-durable hooks, not pi-permission-system
 
@@ -28,26 +28,79 @@ pi-durable's own seam is the tool-task hooks: `beforeTool` can block a call or r
 
 The authorizer judge (a small model consulted before the human on `ask`) is deliberately not wired: the only ask rule that ships is `push_changes`, where every occurrence should reach a human. When bash ask-rules earn their keep, the judge slots in ahead of the approval post in `beforeTool`.
 
-## What waits for the box (Phase 2b runbook)
+## What is live since the single-box activation (12 Nov, evening)
 
-These need hands on infrastructure, not code. In order:
+The runbook below was written around a two-box split that has not happened and
+no longer needs to happen first. The credential proxy activated on the session
+box itself:
 
-1. **Provision the gateway box** (Hetzner, cx22 unless self-hosted Zulip is likely). Private-network it with the session box.
-2. **Move the gateway** there: install docker, copy `/opt/family-agent/.env` (or re-run `deploy/push-secrets.sh` with the new host), run `phase1/deploy/install.sh`; point GitHub Actions' deploy at the new box.
-3. **Activate the credential proxy**: `deploy/proxy/Caddyfile` (reviewed in-repo), with the real OpenRouter key in the proxy's environment only; set `LLM_BASE_URL=http://<gateway-box-ip>:8080/llm` and a placeholder `OPENROUTER_API_KEY` in the gateway's `.env`.
-4. **Lock session egress**: `deploy/egress-lockdown.sh on <gateway-box-ip>` on the session box — DNS, package registries, and the gateway box only. Operator-run, with a live session watched. Registry IPs are CDN-resolved at run time; re-run after boot.
-5. **Rotate the Phase 1 credentials** (below).
-6. Harden the exec container profile further (read-only rootfs, dropped capabilities) — optional, next pass.
+1. **`fa-proxy`** (Caddy, `deploy/proxy/Caddyfile`) runs as a compose service
+   beside the gateway. Keys live only in `/opt/family-agent/proxy.env` (mode
+   600): OpenRouter, Kagi, Brave. The gateway's `.env` holds a placeholder
+   `OPENROUTER_API_KEY` plus `LLM_BASE_URL=http://fa-proxy:8080/llm` and
+   `SEARCH_PROXY_URL=http://fa-proxy:8080`; the search tools send no auth
+   headers in proxy mode (direct mode remains for local runs and rollback:
+   unset `LLM_BASE_URL`/`SEARCH_PROXY_URL`, restore keys in `.env`).
+2. **Why the deviation:** the gateway process is trusted either way — the
+   property that ships is that key material leaves the environment of the
+   process that talks to the untrusted half of the network, and Phase 3
+   open-world responses get a checkpoint. The DM-first system is mid
+   acceptance testing (a bad moment to move boxes), the dead stacks that
+   motivated the urgency are destroyed, and moving the proxy to a gateway box
+   later is one URL change. The split remains open, not scheduled.
+3. **Known exception, by design:** the mark sidecar token is *not* proxied.
+   Its viewer URL carries the token into conversations on purpose
+   (`phase1/exec/mark`); fronting only the registration call would change
+   nothing. A real fix means sidecar sessions — deferred.
 
-## Credential rotation checklist
+## What still waits for the operator
 
-Phase 1's rule: when Phase 2 lands, rotate everything Phase 1's sessions could have seen. Exec containers never held keys (verify below), but the window the rule covers closes only by rotation:
+1. **Lock session egress**: `deploy/egress-lockdown.sh` — still operator-run,
+   still NOT ACTIVE, now next after the proxy soaks. On a single box it must
+   allow the gateway's own destinations (Zulip, OpenRouter-via-proxy is
+   internal, search APIs — now also internal) — the script's
+   `ALLOW_EXTRA_HOSTS` plus a rule allowing the compose network is the shape.
+   Registry IPs are CDN-resolved at run time; re-run after boot.
+2. **Rotate the exposed keys** (below).
+3. Harden the exec container profile further (read-only rootfs, dropped
+   capabilities) — optional, next pass.
 
-1. Rotate the **Zulip bot API key** (organization settings → the bot user → edit) and the **OpenRouter key** (console). Generate, don't reuse.
-2. Re-run `deploy/push-secrets.sh` (it rewrites the box's `.env`; update its host first if the gateway moved).
-3. Restart the gateway: `docker compose -f /opt/family-agent/phase1/deploy/docker-compose.yml restart gateway`. Order matters: rotate → write `.env` → restart; expect one polling gap.
-4. Set **branch protection on `main`** on GitHub (Settings → Branches) if not already done: the deploy key and `DEPLOY_SSH_KEY` both grant push/box access to anyone who can edit the repo.
-5. Verify: `docker exec fa-gateway env | grep -c KEY` shows only names; a session's `env` shows none; `docker logs fa-gateway` shows no auth failures.
+## Credential rotation checklist (revised 12 Nov)
+
+The old checklist assumed the nanobot stacks were live neighbors. They are
+destroyed (Fly apps deleted; the local Apple Containers stack stopped and
+its launch agent disabled). What remains exposed is *files*: the dead stack's
+`.env` on the Mac (`~/code/polynumeral-assistant/.env`) still holds valid
+credentials for the bot user and several APIs.
+
+**Keys of the live system that sat in the dead stack's env — rotate these:**
+
+1. **Zulip bot API key** (Zulip org settings → the bot user → edit). New value
+   goes to `/opt/family-agent/.env` on the box (`ZULIP_API_KEY`), then
+   `docker compose -f /opt/family-agent/phase1/deploy/docker-compose.yml
+   restart gateway`. One polling gap.
+2. **Brave search key** (Brave dashboard). New value goes to
+   `/opt/family-agent/proxy.env` on the box (`BRAVE_API_KEY`), then
+   `docker restart fa-proxy`. No gateway restart needed.
+
+**Keys that never sat in the dead stack — no rotation required:** OpenRouter
+(sourced from `~/.pi/agent/auth.json`), Kagi (sourced from 1Password), the
+mark token (Phase 1-only). Rotate on general hygiene if desired.
+
+**Dead-stack credentials that are still valid until rotated or revoked —
+kill them at their providers:** the Fastmail token, the Gmail app password,
+the Groq key, the Anthropic key, the Zulip test-user key (all in the dead
+`.env` on the Mac). The stacks that used them are gone; revoke rather than
+rotate. Then scrub that file.
+
+**Repo hygiene, if not already done:** branch protection on `main` on GitHub
+(Settings → Branches) — the deploy key and `DEPLOY_SSH_KEY` both grant
+push/box access to anyone who can edit the repo.
+
+Verification after any rotation: `docker exec fa-gateway env | grep -c KEY`
+shows only names; a session's `env` shows none; `docker logs fa-gateway`
+shows no auth failures. Note: `push-secrets.sh` rewrites `.env` wholesale
+and is for cold setups — on the live box, edit the two files in place.
 
 ## Verification
 

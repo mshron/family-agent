@@ -1,6 +1,19 @@
 name: family-agent
 
 services:
+  # Credential proxy (Phase 2): every upstream key lives in proxy.env on
+  # this container alone. The gateway reaches it by compose DNS; nothing
+  # else needs to reach it, so the port binds to loopback only (tests).
+  proxy:
+    image: caddy:2
+    container_name: fa-proxy
+    restart: unless-stopped
+    env_file: /opt/family-agent/proxy.env
+    volumes:
+      - ./proxy/Caddyfile:/etc/caddy/Caddyfile:ro
+    ports:
+      - "127.0.0.1:8080:8080"
+
   gateway:
     build: ../gateway
     image: family-agent-gateway:latest
