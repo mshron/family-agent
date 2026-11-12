@@ -172,11 +172,14 @@ const rules = new PermissionRules({
     undefined
   );
   assert.equal(config.people["a@example.com"].workStream, "a-work");
-  // The skills loop (dm-first memo, step 5) ships in every tool set, ask-gated
+  // The skills loop (dm-first memo, step 5) ships in every tool set, with
+  // post-hoc consent: no ask rule gates it (autonomy, 12 Nov review)
   assert.equal(config.toolsFor("dm-1").includes("save_skill"), true);
-  assert.equal(config.toolsFor("scratch").includes("update_skill"), true);
-  assert.equal(config.toolsFor("meta").includes("save_skill"), true);
-  ok("channel config: dm tool set, dm permission fallback, people entries, skills tools");
+  assert.equal(config.toolsFor("scratch").includes("delete_skill"), true);
+  const rules = new PermissionRules(config.permissionConfigFor("dm-1"));
+  assert.equal(rules.classifyTool("save_skill").decision, "allow");
+  assert.equal(rules.classifyTool("delete_skill").decision, "allow");
+  ok("channel config: dm tool set, dm permission fallback, people entries, skills tools ungated");
 }
 
 // --- the ask flow ------------------------------------------------------------
@@ -485,6 +488,21 @@ function fakeApi({ stream = "meta", memos } = {}) {
   assert.equal(resolved, true);
   assert.equal(await decision, undefined);
   ok("mayResolve: owners still resolve when mayResolve declines");
+}
+
+{
+  // No auto-deny by default (12 Nov review): the ask waits until someone
+  // reacts or the run is stopped. An env-set timeout keeps the old text.
+  const p = build({ askTimeoutMs: 0 });
+  p.extension.hooks[0].handlers.beforeTool(
+    { id: "c9c", name: "push_changes", arguments: {} },
+    fakeApi(),
+    {}
+  );
+  await new Promise((r) => setTimeout(r, 5));
+  assert.match(posted.at(-1).content, /waits until you do\./);
+  assert.doesNotMatch(posted.at(-1).content, /Auto-denied/);
+  ok("ask: no timeout means the ask waits for a reaction");
 }
 
 console.log(`\npermissions contract: ${passed} checks passed`);

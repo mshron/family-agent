@@ -1,10 +1,6 @@
 {
   "streams": ["scratch", "meta"],
   "permissions": {
-    "tools": {
-      "save_skill": "ask",
-      "update_skill": "ask"
-    },
     "bash": {
       "rm -rf /*": "deny",
       "sudo *": "deny"

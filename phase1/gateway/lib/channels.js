@@ -21,6 +21,7 @@ export const STANDARD_TOOLS = [
   "upload_file",
   "save_skill",
   "update_skill",
+  "delete_skill",
 ];
 
 export class ChannelConfig {

@@ -80,7 +80,9 @@ const env = {
   OPENROUTER_API_KEY: requireEnv("OPENROUTER_API_KEY"),
   IDLE_MINUTES: Number(process.env.IDLE_MINUTES) || IDLE_MINUTES,
   AUDIT_DIR: process.env.AUDIT_DIR || "/opt/family-agent/audit",
-  ASK_TIMEOUT_MS: (Number(process.env.ASK_TIMEOUT_MINUTES) || 20) * 60_000,
+  // 0 = asks wait for a reaction indefinitely (no auto-deny; dm-first
+  // review: a person's ask should not expire while they are away).
+  ASK_TIMEOUT_MS: (Number(process.env.ASK_TIMEOUT_MINUTES) || 0) * 60_000,
   ZULIP_OWNER_EMAILS: (process.env.ZULIP_OWNER_EMAILS || "")
     .split(",")
     .map((s) => s.trim())
@@ -518,8 +520,8 @@ const INSTRUCTIONS = [
   "Follow the workspace conventions in the conventions section: notes in notes/, writeups in docs/,",
   "durable facts in memory/ (say in your reply when you change memory).",
   "history_search finds past conversations in this channel; spawn_thread and fork_thread create new topics.",
-  "When you finish a job and learn a better way to do this kind of work, call save_skill with the method;",
-  "the person approves it in chat, and future task conversations load it.",
+  "When you finish a job and learn a better way to do this kind of work, call save_skill with the method, then tell the person",
+  "what you kept and ask whether to keep it (delete_skill removes it if not); future task conversations load saved skills.",
 ].join(" ");
 
 const INSTRUCTIONS_DM = [
@@ -531,7 +533,7 @@ const INSTRUCTIONS_DM = [
   "- Real jobs (document processing, file transformations, multi-step deliverables): call run_task. It starts a task conversation in the person's work stream (visible there as a topic), waits, and returns the result here. Files the person sends land in uploads/ — pass those paths along. Say that you delegated, and where the work is visible.",
   "- run_task with wait=false runs the job in the background; its result arrives here when it finishes.",
   "- Every delegated job is recorded in the task ledger (tasks.md in the workspace); the /tasks command and the nightly consolidation read it.",
-  "- When the same kind of job repeats, or the person gives durable feedback on how work should be done, call save_skill to keep the method as a skill (it asks for approval first). Future task conversations load saved skills.",
+  "- When the same kind of job repeats, or the person gives durable feedback on how work should be done, call save_skill to keep the method as a skill. Tell the person what you saved and ask whether to keep it; delete_skill removes it if not. Future task conversations load saved skills.",
   "- Memory lives in memory/ files and loads fresh on every message. When the user says \"remember X\" or \"forget Y\", edit the matching memory file and say what changed. Never put anything in memory the user would not want kept.",
   "- Some turns are scheduled passes (marked as such): propose memory edits in your reply, and apply them only after the user agrees.",
   "history_search finds past conversations in direct messages; there are no topics here, so spawn_thread and fork_thread do not apply.",
@@ -736,6 +738,20 @@ async function saveSkillToStream(stream, { name, description, instructions, mode
   const slug = skillSlug(name);
   const dir = path.join(env.SKILLS_DIR, stream, slug);
   const file = path.join(dir, "SKILL.md");
+  if (mode === "delete") {
+    if (!existsSync(file)) throw new Error(`no skill named "${slug}" exists in ${stream}`);
+    let r = await gitRun(["rm", "-r", "-q", path.join(stream, slug)]);
+    if (r.code !== 0) throw new Error(`git rm failed: ${r.out.slice(0, 200)}`);
+    r = await gitRun([
+      "-c", "user.name=family-agent gateway",
+      "-c", "user.email=gateway@family-agent.local",
+      "commit", "-qm", `delete skill ${stream}/${slug}`,
+    ]);
+    if (r.code !== 0) throw new Error(`git commit failed: ${r.out.slice(0, 200)}`);
+    audit.record("skill", { stream, skill: slug, mode });
+    log.info(`skill deleted: ${stream}/${slug}`);
+    return { slug, dir: `${stream}/${slug}` };
+  }
   if (mode === "save" && existsSync(file)) {
     throw new Error(`a skill named "${slug}" already exists in ${stream}; use update_skill to change it`);
   }

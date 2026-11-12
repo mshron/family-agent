@@ -174,7 +174,10 @@ export function buildPermissionsExtension({
   describe,
   isOwner,
   mayResolve,
-  askTimeoutMs = 20 * 60_000,
+  // 0 (default) = the ask waits until someone reacts or the run is stopped:
+  // no auto-deny. A positive value keeps the old expiry, for tests or a
+  // channel that needs it (ASK_TIMEOUT_MINUTES on the box).
+  askTimeoutMs = 0,
 }) {
   /** approval message id -> Set of waiters (a restart-rerun shares the id) */
   const pending = new Map();
@@ -184,7 +187,7 @@ export function buildPermissionsExtension({
     if (!waiters || waiters.size === 0) return false;
     pending.delete(messageId);
     for (const entry of waiters) {
-      clearTimeout(entry.timer);
+      if (entry.timer) clearTimeout(entry.timer);
       entry.resolve(outcome);
     }
     return true;
@@ -198,7 +201,10 @@ export function buildPermissionsExtension({
         channel,
         call,
         resolve,
-        timer: setTimeout(() => settle(messageId, { status: "expired" }), askTimeoutMs),
+        timer:
+          askTimeoutMs > 0
+            ? setTimeout(() => settle(messageId, { status: "expired" }), askTimeoutMs)
+            : null,
       };
       let waiters = pending.get(messageId);
       if (!waiters) {
@@ -209,7 +215,7 @@ export function buildPermissionsExtension({
       if (signal) {
         const onAbort = () => {
           waiters.delete(entry);
-          clearTimeout(entry.timer);
+          if (entry.timer) clearTimeout(entry.timer);
           resolve({ status: "aborted" });
         };
         if (signal.aborted) onAbort();
@@ -315,15 +321,17 @@ export function buildPermissionsExtension({
       /* the generic summary is enough */
     }
     const argsText = JSON.stringify(call.arguments ?? {}).slice(0, 400);
-    const waitText = askTimeoutMs >= 60_000
-      ? `${Math.round(askTimeoutMs / 60_000)} minutes`
-      : `${Math.round(askTimeoutMs / 1000)} seconds`;
+    const waitText =
+      askTimeoutMs >= 60_000
+        ? `${Math.round(askTimeoutMs / 60_000)} minutes`
+        : `${Math.round(askTimeoutMs / 1000)} seconds`;
     const content =
       `🔒 **${call.name}** needs approval.` +
       (extra ? `\n\n${extra}` : "") +
       (call.name === "bash" ? `\n\n\`${String(call.arguments?.command ?? "").slice(0, 300)}\`` : "") +
       (argsText && argsText !== "{}" ? `\n\nArguments: \`${argsText}\`` : "") +
-      `\n\nReact with ✅ to approve or ❌ to deny. Auto-denied after ${waitText}.`;
+      `\n\nReact with ✅ to approve or ❌ to deny.` +
+      (askTimeoutMs > 0 ? ` Auto-denied after ${waitText}.` : " It waits until you do.");
 
     let messageId;
     try {

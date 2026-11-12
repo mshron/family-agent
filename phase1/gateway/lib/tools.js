@@ -536,18 +536,23 @@ export function buildZulipTools({
     },
   });
 
-  // Skills loop (dm-first memo, step 5). Skills are prompt content: the
-  // exec containers mount the skills tree read-only, so writing happens
-  // gateway-side (git-committed, ask-gated by the permission layer). A
-  // front conversation saves into the person's work stream, where task
+  // Skills loop (dm-first memo, step 5, revised the same day for autonomy):
+  // the agent saves and amends skills on its own and asks the person
+  // afterward whether to keep each one (post-hoc consent; the git-versioned
+  // tree is the tamper-evidence, and delete_skill removes what the person
+  // declines). Skills are prompt content: the exec containers mount the
+  // skills tree read-only, so writes happen gateway-side. A front
+  // conversation saves into the person's work stream, where task
   // conversations load skills; a task or stream conversation saves into
   // its own stream.
   const skillResult = (mode, r) =>
-    `Skill ${mode === "save" ? "saved" : "updated"}: ${r.dir}. Future task conversations in that stream load it automatically when the description matches. Tell the user what you kept and why.`;
+    `Skill ${mode === "save" ? "saved" : "updated"}: ${r.dir}. Future task conversations in that stream load it automatically when the description matches. ` +
+    `Tell the person now what you kept and why, and ask whether to keep it. ` +
+    `If they say no, call delete_skill with the same name.`;
   const saveSkillTool = defineTool({
     name: "save_skill",
     description:
-      "Save a skill: a reusable, step-by-step method for a kind of job, stored as a skill that future task conversations load automatically. Use it when a job reveals a repeatable method (a workflow, a file format, a recurring deliverable) or when the person gives durable feedback on how work should be done. Requires the person's approval in chat. Name it after the kind of job (e.g. 'apa-citation-fixes'); instructions are the complete method, written for an agent that knows nothing else.",
+      "Save a skill: a reusable, step-by-step method for a kind of job, stored as a skill that future task conversations load automatically. Use it when a job reveals a repeatable method (a workflow, a file format, a recurring deliverable) or when the person gives durable feedback on how work should be done. After saving, tell the person what you kept and ask whether to keep it. Name it after the kind of job (e.g. 'apa-citation-fixes'); instructions are the complete method, written for an agent that knows nothing else.",
     parameters: Type.Object({
       name: Type.String({ description: "Short skill name, kebab-case (e.g. 'docx-citation-fixes')" }),
       description: Type.String({ description: "One sentence: what the skill does and when to use it — this is what future agents see when deciding to load it" }),
@@ -567,7 +572,7 @@ export function buildZulipTools({
   const updateSkillTool = defineTool({
     name: "update_skill",
     description:
-      "Update the instructions of an existing skill (from feedback or a changed method). Requires the person's approval in chat. Keep the description accurate; instructions replace the old ones entirely.",
+      "Update the instructions of an existing skill (from feedback or a changed method). Tell the person what changed, and ask whether to keep it. Keep the description accurate; instructions replace the old ones entirely.",
     parameters: Type.Object({
       name: Type.String({ description: "The existing skill's name" }),
       instructions: Type.String({ description: "The complete updated method as markdown (replaces the old instructions)" }),
@@ -585,6 +590,29 @@ export function buildZulipTools({
     },
   });
 
+  const deleteSkillTool = defineTool({
+    name: "delete_skill",
+    description:
+      "Delete a skill the person declined to keep (or one that proved wrong). Removed skills stop loading in future conversations; the git history keeps the old text.",
+    parameters: Type.Object({
+      name: Type.String({ description: "The skill's name" }),
+    }),
+    replay: "safe",
+    async execute(args, api, context) {
+      if (!onSaveSkill) return err("delete_skill is not available in this channel.");
+      try {
+        const r = await onSaveSkill(api.conversationId, { ...args, mode: "delete" });
+        return {
+          content: [
+            { type: "text", text: `Skill deleted: ${r.dir}. Confirm to the person that it is gone.` },
+          ],
+        };
+      } catch (e) {
+        return err(`delete_skill failed: ${e.message}`);
+      }
+    },
+  });
+
   return defineExtension({
     name: "zulip",
     tools: [
@@ -598,6 +626,7 @@ export function buildZulipTools({
       uploadFileTool,
       saveSkillTool,
       updateSkillTool,
+      deleteSkillTool,
     ],
   });
 }
