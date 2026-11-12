@@ -69,6 +69,10 @@ add_for_family() {
     done
   done
   for ip in $ips; do
+    # Skip addresses that do not belong to this family (10.0.0.4 is not an
+    # ip6tables destination; ::ffff: forms are not iptables destinations).
+    if [ "$ipt" = ip6tables ] && [ "${ip#*:}" = "$ip" ]; then continue; fi
+    if [ "$ipt" = iptables ] && [ "${ip#*:}" != "$ip" ]; then continue; fi
     $ipt -I "$CHAIN" $idx -d "$ip" -m comment --comment "$MARK" -j RETURN
     idx=$((idx + 1))
     echo "  allow ip $ip [$ipt]"

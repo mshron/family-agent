@@ -28,11 +28,11 @@ pi-durable's own seam is the tool-task hooks: `beforeTool` can block a call or r
 
 The authorizer judge (a small model consulted before the human on `ask`) is deliberately not wired: the only ask rule that ships is `push_changes`, where every occurrence should reach a human. When bash ask-rules earn their keep, the judge slots in ahead of the approval post in `beforeTool`.
 
-## What is live since the single-box activation (12 Nov, evening)
+## What is live since the single-box activation (12 Nov, morning)
 
-The runbook below was written around a two-box split that has not happened and
-no longer needs to happen first. The credential proxy activated on the session
-box itself:
+(Kept for the record; the same evening the proxy moved to the vault box — see
+"The split as shipped" below. The runbook's two-box-first order was overtaken
+by events.) The credential proxy activated on the session box itself:
 
 1. **`fa-proxy`** (Caddy, `deploy/proxy/Caddyfile`) runs as a compose service
    beside the gateway. Keys live only in `/opt/family-agent/proxy.env` (mode
@@ -83,17 +83,61 @@ box itself:
    logs is itself a signal), unattended-upgrades. The session box cannot be
    trusted to report its own compromise.
 
+## The split as shipped (12 Nov, night)
+
+The single-box activation lasted half a day. The **vault box** (cx23,
+49.13.26.153 public, 10.0.0.4 on chat-net) now holds:
+
+- **fa-proxy**, published on the private IP only, host-firewalled to the
+  session box's IP (10.0.0.3). After the deploy that retired the session
+  box's fa-proxy service, its `proxy.env` was deleted: the session box holds
+  no upstream credential at all. A full compromise of it — host root
+  included — reaches no key material.
+- **Monitoring**: auditd, AIDE baseline, unattended-upgrades, rsyslog
+  receiving the session box's host logs (journald forward over TCP 514;
+  absence of forwarded logs is itself a signal).
+- **Backups**: nightly 04:15 rsync of `durable/`, `audit/`, `workspaces/`,
+  `skills/` from the session box through a restricted rrsync key (forced
+  command, write-only into the backup tree, no `--delete` — a damaged
+  source never destroys the copy). First run verified: 143 MB workspaces,
+  9.9 MB durable.
+
+Session-box side: gateway recreated with `LLM_BASE_URL` and
+`SEARCH_PROXY_URL` at `10.0.0.4:8080`; **egress lockdown ON** (v4+v6;
+  registries for builds, Zulip, GitHub for the deploy key, the vault IP,
+  the mark sidecar's on-host address; everything else REJECTed). Verified
+  from a live exec container: internet refused, allowed paths open.
+  LibreChat's sandbox-runner still lives on this box and is subject to the
+  same rules — its code-interpreter may have lost outbound access it
+  needed; watched, and `egress-lockdown.sh off` reverts in one command.
+
+Two operational lessons, both from my own mistakes that evening:
+
+1. **`docker compose restart` does not re-read `env_file`.** The cutover
+   restarted instead of recreating, so the gateway kept its old LLM URL for
+   half an hour after the old proxy container was removed; two user
+   messages got the provider-error fallback. Env changes ship via
+   `up -d` (recreates on config change). Verification must check the live
+   process environment — `docker exec fa-gateway env` — not the file, and
+   not the network path from the container's shell.
+2. **Never overwrite `authorized_keys`; append.** I replaced the file
+   with only the new restricted backup key and locked every human out of
+   the brand-new vault. The API root-password reset is useless on the
+   standard image: password SSH auth is disabled, and the console is the
+   reset password's only consumer. Recovery was destroy-and-recreate with
+   everything in cloud-init — which is the real lesson: **the box is a
+   script, not a pet.** `proxy.env` is the only state outside the repo,
+   and it moves in one scp; `deploy/proxy/cloud-init.yaml` now carries the
+   rest.
+
 ## What still waits for the operator
 
-1. **Lock session egress**: `deploy/egress-lockdown.sh` — still operator-run,
-   still NOT ACTIVE, now next after the proxy soaks. On a single box it must
-   allow the gateway's own destinations (Zulip, OpenRouter-via-proxy is
-   internal, search APIs — now also internal) — the script's
-   `ALLOW_EXTRA_HOSTS` plus a rule allowing the compose network is the shape.
-   Registry IPs are CDN-resolved at run time; re-run after boot.
-2. **Rotate the exposed keys** (below).
-3. Harden the exec container profile further (read-only rootfs, dropped
+1. **Rotate the exposed keys** (below).
+2. Harden the exec container profile further (read-only rootfs, dropped
    capabilities) — optional, next pass.
+3. Re-run `egress-lockdown.sh on` after a box reboot or registry IP
+   churn (CDN-resolved at run time); a systemd/cron wrapper belongs on the
+   box when this becomes default.
 
 ## Credential rotation checklist (revised 12 Nov)
 

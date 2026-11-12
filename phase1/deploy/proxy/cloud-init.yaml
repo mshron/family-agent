@@ -1,0 +1,21 @@
+# Vault box bootstrap, part 1 of 2: cloud-init for the server CREATE
+# (part 2 is bootstrap.sh, run once SSH is up). Together these make the box
+# a script, not a pet: destroy-and-recreate is the recovery path. The only
+# state outside this repo is proxy.env (keys, one scp from the session box).
+# The restricted backup key here is the session box's /root/.ssh/id_ed25519
+# (public key; regenerated if the session box is ever rebuilt — update here).
+#cloud-config
+users:
+  - name: root
+    ssh_authorized_keys:
+      - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILqEDWBKqJoavD5xavEz8w6QJOCRXcdQpZ32H2xHd7ZB mshron@Maxs-Tribe-Laptop.local
+      - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIK3fDoWhld5ibKoAcjOYvMqScY1zUl2Xtav4c5xfkz7q vault-deploy
+runcmd:
+  - echo 'command="/usr/local/bin/backup-receive",no-agent-forwarding,no-port-forwarding ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHuqg5muVGvPWSnh5CwH1BCUOvZJWQoCNwXq+5kkp7A9 code-to-vault-backup' >> /root/.ssh/authorized_keys
+  - mkdir -p /root/.ssh /opt/family-agent-backups/code
+  - chmod 700 /root/.ssh && chmod 600 /root/.ssh/authorized_keys
+  - printf '%s\n' '#!/bin/sh' 'exec /usr/bin/rrsync -wo /opt/family-agent-backups/code' > /usr/local/bin/backup-receive
+  - chmod 755 /usr/local/bin/backup-receive
+  - apt-get update -qq
+  - apt-get install -y -qq rsync
+  - passwd -l root

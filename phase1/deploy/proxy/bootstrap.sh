@@ -21,35 +21,41 @@ apt-get install -y -qq docker.io docker-compose-v2 auditd aide rsyslog >/dev/nul
 
 # Firewall: SSH from anywhere (key-only auth), the proxy and syslog ports
 # from the session box only, established traffic back, everything else
-# dropped. Persistent via iptables-persistent if present, else a systemd
-# unit reloads them at boot.
-cat > /etc/family-agent-vault.rules <<EOF
-*filter
-:INPUT DROP [0:0]
-:FORWARD DROP [0:0]
-:OUTPUT ACCEPT [0:0]
--A INPUT -i lo -j ACCEPT
--A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
--A INPUT -p tcp --dport 22 -j ACCEPT
--A INPUT -p tcp -s $SESSION_BOX_IP --dport 8080 -j ACCEPT
--A INPUT -p tcp -s $SESSION_BOX_IP --dport 514 -j ACCEPT
-COMMIT
+# dropped. ADDITIVE INPUT rules only — never iptables-restore the whole
+# filter table here, that wipes Docker's chains and breaks networking.
+# The INPUT chain is ours alone (flush + rebuild); FORWARD/OUTPUT and all
+# IPv6 forwarding stay as Docker wants them.
+cat > /usr/local/sbin/family-agent-firewall <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+for ipt in iptables ip6tables; do
+  command -v "\$ipt" >/dev/null || continue
+  "\$ipt" -F INPUT
+  "\$ipt" -A INPUT -i lo -j ACCEPT
+  "\$ipt" -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+  "\$ipt" -A INPUT -p tcp --dport 22 -j ACCEPT
+  "\$ipt" -A INPUT -p tcp -s $SESSION_BOX_IP --dport 8080 -j ACCEPT
+  "\$ipt" -A INPUT -p tcp -s $SESSION_BOX_IP --dport 514 -j ACCEPT
+  "\$ipt" -P INPUT DROP
+done
 EOF
-iptables-restore < /etc/family-agent-vault.rules
+chmod +x /usr/local/sbin/family-agent-firewall
 mkdir -p /etc/systemd/system
 cat > /etc/systemd/system/family-agent-firewall.service <<'EOF'
 [Unit]
 Description=family-agent vault firewall rules
+Before=docker.service
 After=network-online.target
 Wants=network-online.target
 [Service]
 Type=oneshot
-ExecStart=/usr/sbin/iptables-restore /etc/family-agent-vault.rules
+ExecStart=/usr/local/sbin/family-agent-firewall
 RemainAfterExit=yes
 [Install]
 WantedBy=multi-user.target
 EOF
 systemctl enable --now family-agent-firewall.service >/dev/null 2>&1 || true
+systemctl restart docker.service   # rebuild the chains the first restore clobbered, if any
 
 # rsyslog: receive the session box's logs (TCP 514, from the session box
 # only per the firewall) into a dedicated file tree.
