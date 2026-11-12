@@ -3,6 +3,7 @@
 
 import { Type } from "@earendil-works/pi-ai";
 import {
+  configure,
   defineExtension,
   defineTool,
 } from "@earendil-works/pi-durable";
@@ -216,7 +217,136 @@ const historySearchTool = defineTool({
 // ---------------------------------------------------------------------------
 // Threads: fork this conversation, or spawn a fresh subagent thread.
 
-export function buildZulipTools({ onThreadCreated, onPushChanges, onUpload }) {
+export function buildZulipTools({
+  onThreadCreated,
+  onPushChanges,
+  onUpload,
+  resolveWorkStream,
+  onTaskAgent,
+  uniqueTopicFor,
+}) {
+  const err = (text) => ({ content: [{ type: "text", text }] });
+
+  // The DM front conversation's delegation tool (the dm-first memo). It
+  // starts a task conversation as a topic of the person's work stream:
+  // the task's steps and spoilers are visible there, while the DM gets the
+  // answer. Sync runs use the pi-durable subagent pattern — the child is
+  // owned by this tool call's task, so a crash rerun reuses it and /stop
+  // aborts it; wait=false runs ownerless in the background, and the
+  // gateway posts the result back into the DM when it finishes.
+  const runTaskTool = defineTool({
+    name: "run_task",
+    description:
+      "Start a task conversation for a self-contained job and get its answer back. The task runs in the person's work stream as its own topic (its steps are visible there) while this conversation waits. Use it for multi-step jobs: document processing, file transformations, deliverables. Pass file paths (uploads land in uploads/). Set wait=false to run in the background instead; the result will be posted into this thread when the task finishes.",
+    parameters: Type.Object({
+      topic: Type.String({ description: "Short topic name for the task, 2-4 words" }),
+      task: Type.String({ description: "The complete, self-contained task for the task conversation, including the file paths it should use" }),
+      wait: Type.Optional(Type.Boolean({ description: "Wait for the result and return it (default true). false = run in the background." })),
+    }),
+    replay: "safe",
+    async execute(args, api, context) {
+      const mine = await api.snapshot(ZulipDoc, api.conversationId, context);
+      if (!mine) return err("No channel mapping for this conversation.");
+      if (!mine.recipients) {
+        return err("run_task is for direct messages — in a channel, use spawn_thread instead.");
+      }
+      if (!resolveWorkStream || !onTaskAgent || !uniqueTopicFor) {
+        return err("run_task is not available in this channel.");
+      }
+      const target = await resolveWorkStream(mine);
+      if (!target?.stream) return err(target?.error || "No work stream is configured for this conversation.");
+      const stream = target.stream;
+      const topic = uniqueTopicFor(stream, args.topic);
+      const header =
+        `*(task for ${mine.person?.name ?? mine.person?.email ?? "the user"}, ` +
+        `delegated from the direct-message thread — task: ${String(args.task).slice(0, 150)})*`;
+      const mapping = { kind: "task", stream, topic, header };
+      // tx.createConversation only takes ownership; the agent (model,
+      // instructions, tools) is set with configure() and the doc in the same
+      // commit — the pattern spawn_thread already uses. Runs on the caller's
+      // tx; never nests commits.
+      const createChild = async (tx, ownership) => {
+        const record = await tx.createConversation({ ownership });
+        await configure(tx, record.id, onTaskAgent(stream, mine.model));
+        const doc = await tx.doc(ZulipDoc, record.id);
+        doc.stream = stream;
+        doc.topic = topic;
+        doc.origin = { taskFrom: mine.topic };
+        doc.model = "auto";
+        return record.id;
+      };
+
+      if (args.wait !== false) {
+        // Sync: the child belongs to this tool call's task. The ownership
+        // index makes a crash rerun reuse the same child; the same
+        // requestId makes it reuse the same submission.
+        let childId = await api.commit(async (tx) => {
+          const existing = (await tx.scanConversations({ ownerTaskId: api.taskId }, 1)).items[0];
+          if (existing !== undefined) return existing.id;
+          return createChild(tx, { kind: "task", taskId: api.taskId });
+        }, context);
+        await api.details({ conversationId: childId }, context);
+        await onThreadCreated?.(childId, mapping);
+        const child = await api.conversation(childId, context);
+        if (!child) return err(`The task conversation is gone (${topic}).`);
+        const submission = await child.submit(
+          { type: "input", content: args.task, requestId: `task:${childId}`, whenBusy: "followUp" },
+          context
+        );
+        const settled = await submission.wait(context);
+        if (settled.status !== "done") {
+          return err(
+            `The task "${topic}" did not finish (${settled.status}` +
+              `${settled.reason ? ": " + settled.reason : ""}). Tell the user what happened.`
+          );
+        }
+        const answer = await api.commit(async (tx) => {
+          const page = await tx.scanEntries(
+            { conversationId: childId, minEntryId: settled.answer, maxEntryId: settled.answer },
+            1
+          );
+          const message = page.items[0]?.model?.[0];
+          return message && message.role === "assistant"
+            ? contentText(message.content).trim()
+            : "";
+        }, context);
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                `Task "${topic}" finished (visible in ${stream}). Answer:\n\n` +
+                (answer.slice(0, 4000) || "*(no text — check the task topic)*"),
+            },
+          ],
+        };
+      }
+
+      // Fire-and-forget: an ownerless child the gateway submits itself
+      // (runSpawnedThread), posting the answer in the task topic and a
+      // follow-up here when it finishes. The memo keeps the child out of
+      // this call's ownership so the call can return at once.
+      let childId = await api.memo(`taskspawn:${stream}:${topic}`, context);
+      if (childId === undefined) {
+        childId = await api.commit((tx) => createChild(tx, { kind: "ownerless" }), context);
+        await api.memo(`taskspawn:${stream}:${topic}`, childId, context);
+      }
+      await onThreadCreated?.(childId, {
+        ...mapping,
+        task: args.task,
+        notify: { dmChannel: mine.stream },
+      });
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Background task "${topic}" started in ${stream}. Its result will be posted here when it finishes. Tell the user it is running and where it is visible.`,
+          },
+        ],
+      };
+    },
+  });
+
   const spawnThreadTool = defineTool({
     name: "spawn_thread",
     description:
@@ -381,6 +511,7 @@ export function buildZulipTools({ onThreadCreated, onPushChanges, onUpload }) {
       searchTool,
       summarizeTool,
       historySearchTool,
+      runTaskTool,
       spawnThreadTool,
       forkThreadTool,
       pushChangesTool,

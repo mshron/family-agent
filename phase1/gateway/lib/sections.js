@@ -58,15 +58,17 @@ export async function streamOfConversation(input, context) {
   return doc?.stream ?? null;
 }
 
-/** AGENTS.md from the conversation's channel workspace. */
-export function conventionsSection(env) {
+/** AGENTS.md from the conversation's channel workspace. `workspaceOf`
+ *  resolves a channel to its workspace directory key (a work stream passes
+ *  its person's DM channel, so tasks share the person's workspace). */
+export function conventionsSection(env, workspaceOf = null) {
   return section(
     "conventions",
     async (input, context) => {
       const stream = await streamOfConversation(input, context);
       if (!stream) return undefined;
       const text = await readIfPresent(
-        path.join(workspaceDir(env, stream), "AGENTS.md")
+        path.join(workspaceDir(env, workspaceOf ? workspaceOf(stream) : stream), "AGENTS.md")
       );
       return text ?? undefined;
     },
@@ -99,12 +101,14 @@ export function skillsSection(env) {
   });
 }
 
-/** User + channel memory, as today's gateway preamble did. */
-export function memorySection(env) {
+/** User + channel memory, as today's gateway preamble did. `workspaceOf`
+ *  as in conventionsSection: a work stream's conversations read and write
+ *  their person's memory, per the dm-first memo's shared-workspace design. */
+export function memorySection(env, workspaceOf = null) {
   return section("memory", async (input, context) => {
     const stream = await streamOfConversation(input, context);
     if (!stream) return undefined;
-    const dir = workspaceDir(env, stream);
+    const dir = workspaceDir(env, workspaceOf ? workspaceOf(stream) : stream);
     const [userMemory, channelMemory] = await Promise.all([
       readIfPresent(path.join(dir, "memory", "user.md")),
       readIfPresent(path.join(dir, "memory", "channels", `${stream}.md`)),

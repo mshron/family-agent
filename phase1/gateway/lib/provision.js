@@ -20,10 +20,12 @@ function run(cmd, args, cwd) {
 
 /**
  * Idempotent: existing workspaces are left untouched, so a boot-time sweep
- * and an invite event can both call this safely.
+ * and an invite event can both call this safely. `workspaceChannel` is the
+ * workspace directory key: a work stream passes its person's DM channel so
+ * task conversations share the person's workspace (skills stay per-stream).
  */
-export async function provisionStream(env, stream, log) {
-  const ws = path.join(env.WORKSPACES_DIR, stream);
+export async function provisionStream(env, stream, log, workspaceChannel = stream) {
+  const ws = path.join(env.WORKSPACES_DIR, workspaceChannel);
   if (!existsSync(ws)) {
     const skeleton = env.WORKSPACE_SKELETON_DIR;
     if (skeleton && existsSync(skeleton)) {

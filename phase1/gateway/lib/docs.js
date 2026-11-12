@@ -17,6 +17,10 @@ export const ZulipDoc = defineDoc({
     // Direct-message conversations: the participants' emails (all, bot
     // included). Null for stream conversations.
     recipients: null,
+    // A one-on-one DM's person: { id, email, name } of the human. Null for
+    // group DMs and stream conversations. The gateway resolves the person's
+    // work stream (task conversations) and shared workspace from it.
+    person: null,
     // Message ids the gateway posted for the current turn (reply + tool-call
     // spoilers). Deleted before an edit/delete re-runs the turn.
     tailPosts: [],

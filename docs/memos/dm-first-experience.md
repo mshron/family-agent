@@ -81,6 +81,19 @@ Decisions closed in review: per-person work streams with the person invited and 
 2. **Consolidation cadence.** Nightly (recommended — it reads pre-compaction entries from storage, so nothing is lost by waiting) vs. after-compaction-only (event-driven, but a chatty person compacts often and gets many small passes).
 3. **Task ledger location:** a markdown file in the person's workspace (grep-able, person-visible, backed up with everything else) vs. a durable document. The file is recommended — it is also what the skill-recurrence instructions and the nightly consolidation pass read.
 
+## Implementation (as built, 12 Nov 2026)
+
+The build order's steps 1–4 shipped in one gateway change (the skills loop, step 5, remains). As-built deltas from the plan:
+
+1. **Work streams resolve without config for owners.** A `people` entry in channels.json (email → stream name) wins; an owner without one gets an auto-derived `<first-name>-work` stream, created, joined, and invited on first `run_task`. Anyone else fails closed: delegation needs a `people` entry.
+2. **The shared workspace is a channel-level override**, not a new workspace scheme: a work stream's conversations mount the person's DM workspace (files, uploads, memory, conventions). Skills stay per-stream. Task conversations therefore read and write the person's memory — which is why the memory gate below had to be global.
+3. **The memory gate is a new `paths` permission surface** (`write`/`edit` on `memory/*` → ask, in the global block): it covers the DM front conversation *and* task conversations. Residual gap: a bash write to memory bypasses it — the gate is tamper-evidence, not a hard boundary. The wife's asks will post in the work topic; until her permission profile lands (step 5), only owners can resolve them.
+4. **The consolidation pass proposes, never writes** (a 5am ask that auto-denies would be worse): it lists edits, the person confirms in chat, the session applies them through the ask gate. Scheduled passes run quiet — spoilers suppressed — and `CONSOLIDATE_HOUR` (default 5) and `PROACTIVE_LIMIT_PER_HOUR` (default 8) are env-tunable.
+5. **Task conversations run the flash model** unless the front conversation pinned strong (`/model strong`); the fire-and-forget path gets the auto-classifier like any spawned thread. Their instructions are the stream ones ("Max's personal assistant") — generic wording when the second user arrives is part of step 5.
+6. **Existing DM conversations are migrated at boot**: the person field is backfilled, and tools/instructions are reconfigured (they are fixed at creation) — without this, the flagship DM would never have offered `run_task`.
+
+Verified by `node --check` over every touched file and the extended contract script (20 checks; path rules, dm tool fallback, dm permission fallback, people entries) plus the permissions smoke run. The .docx walkthrough and the live work-stream flows (auto-creation, sync wait, background report, consolidation) need the box: they are the deploy's acceptance tests.
+
 ## Sources reviewed
 
 - `phase1/gateway/`: gateway.js (DM routing, ask resolution, approval integrity), lib/tools.js (spawn_thread/fork_thread), lib/naming.js (topic auto-naming), lib/sections.js (memory, skills listing), lib/provision.js (workspace skeleton).

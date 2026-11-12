@@ -96,6 +96,12 @@ const zulip = new Zulip({
 const channelConfig = await loadChannelConfig(env.CHANNELS_FILE);
 const audit = new AuditLog(env.AUDIT_DIR);
 
+// Person model (dm-first memo): a one-on-one DM is a person's front
+// conversation; the person's work stream holds its task conversations, and
+// both share the person's DM workspace. workStream -> workspace channel.
+const workStreamToWorkspace = new Map();
+const workspaceChannelOf = (channel) => workStreamToWorkspace.get(channel) ?? channel;
+
 // Approval integrity: only the configured owners may resolve an ask. Ids
 // are cached at boot (email -> id lookups can be hidden by the org's email
 // visibility policy); unknown reactors fail closed but the ask stays live.
@@ -155,8 +161,9 @@ async function ensureExecContainer(conversationId, stream) {
   const state = await sh(["inspect", "-f", "{{.State.Running}}", name]);
   if (state.code === 0 && state.stdout.trim() === "true") return name;
   if (state.code === 0) await sh(["rm", "-f", name]);
-  // Read-only skill layers on top of the writable workspace.
-  const mounts = ["-v", `${workspaceDir(env, stream)}:/workspace`];
+  // Read-only skill layers on top of the writable workspace. A work
+  // stream's workspace is its person's DM workspace (shared files).
+  const mounts = ["-v", `${workspaceDir(env, workspaceChannelOf(stream))}:/workspace`];
   const globalSkills = path.join(env.SKILLS_DIR, "global");
   const channelSkills = path.join(env.SKILLS_DIR, stream);
   if (existsSync(globalSkills)) mounts.push("-v", `${globalSkills}:/skills:ro`);
@@ -195,7 +202,7 @@ async function ensureExecContainer(conversationId, stream) {
 const MAX_UPLOAD_BYTES = 64 * 1024 * 1024;
 
 async function uploadWorkspaceFile(stream, relativePath) {
-  const ws = workspaceDir(env, stream);
+  const ws = workspaceDir(env, workspaceChannelOf(stream));
   const abs = path.resolve(ws, String(relativePath));
   if (abs !== ws && !abs.startsWith(ws + path.sep)) {
     throw new Error("path must stay inside the channel's workspace");
@@ -268,18 +275,29 @@ async function summarizePendingPush(stream) {
 
 const FamilySections = defineExtension({
   name: "family",
-  sections: [conventionsSection(env), memorySection(env), skillsSection(env)],
+  sections: [
+    conventionsSection(env, workspaceChannelOf),
+    memorySection(env, workspaceChannelOf),
+    skillsSection(env),
+  ],
 });
 
 const ZulipTools = buildZulipTools({
   onThreadCreated: (conversationId, mapping) => {
+    // A crash rerun (run_task memo, spawn_thread memo, ownership index)
+    // re-registers the same child: keep it mapped, but do not re-post its
+    // header or audit it twice.
+    const rerun = byId.get(conversationId)?.topic === mapping.topic;
     registerConversation(conversationId, mapping);
-    audit.record("thread", {
-      stream: mapping.stream,
-      topic: mapping.topic,
-      task: mapping.task ? String(mapping.task).slice(0, 200) : undefined,
-    });
-    if (mapping.header) {
+    if (!rerun) {
+      audit.record(mapping.kind ?? "thread", {
+        stream: mapping.stream,
+        topic: mapping.topic,
+        task: mapping.task ? String(mapping.task).slice(0, 200) : undefined,
+        notify: mapping.notify?.dmChannel,
+      });
+    }
+    if (mapping.header && !rerun) {
       zulip
         .sendStreamMessage(mapping.stream, mapping.topic, mapping.header)
         .catch((err) => log.error(`header post failed: ${err.message}`));
@@ -291,6 +309,9 @@ const ZulipTools = buildZulipTools({
   },
   onPushChanges: pushWorkspaceToOrigin,
   onUpload: uploadWorkspaceFile,
+  resolveWorkStream: resolveWorkStreamForDoc,
+  onTaskAgent: taskAgentFor,
+  uniqueTopicFor: uniqueTopic,
 });
 
 const registry = createRegistry();
@@ -398,12 +419,19 @@ function dmRoute(message) {
   const others = recipients.filter((r) => r.id !== botUserId);
   const groupKey = "dm-" + others.map((r) => r.id).sort().join("-");
   const emails = recipients.map((r) => r.email);
+  // A one-on-one DM is a person's front conversation: record who the
+  // person is, so run_task can resolve their work stream and workspace.
+  const person =
+    others.length === 1
+      ? { id: others[0].id, email: others[0].email, name: others[0].full_name || null }
+      : null;
   return {
     kind: "dm",
     stream: groupKey, // workspace and channel key: one per DM group
     topic: groupKey,
     conversationKey: `dm::${groupKey}`,
     channel: groupKey,
+    person,
     replyRecipients: emails,
     reply: (content) => zulip.sendPrivateMessage(emails, content),
   };
@@ -473,12 +501,17 @@ const INSTRUCTIONS = [
 ].join(" ");
 
 const INSTRUCTIONS_DM = [
-  "You are Max's personal assistant. You run inside one direct-message thread.",
+  "You are the family assistant. You share one continuous direct-message thread with one person — the front conversation.",
   "Your final reply text is posted to that thread as-is, so answer directly and completely.",
-  "Follow the workspace conventions in the conventions section: notes in notes/, writeups in docs/,",
-  "durable facts in memory/ (say in your reply when you change memory).",
+  "How you work:",
+  "- Small requests: handle them yourself with your tools.",
+  "- Real jobs (document processing, file transformations, multi-step deliverables): call run_task. It starts a task conversation in the person's work stream (visible there as a topic), waits, and returns the result here. Files the person sends land in uploads/ — pass those paths along. Say that you delegated, and where the work is visible.",
+  "- run_task with wait=false runs the job in the background; its result arrives here when it finishes.",
+  "- Memory lives in memory/ files and loads fresh on every message. When the user says \"remember X\" or \"forget Y\", edit the matching memory file and say what changed. Never put anything in memory the user would not want kept.",
+  "- Some turns are scheduled passes (marked as such): propose memory edits in your reply, and apply them only after the user agrees.",
   "history_search finds past conversations in direct messages; there are no topics here, so spawn_thread and fork_thread do not apply.",
-].join(" ");
+  "Workspace conventions: notes in notes/, writeups in docs/, uploads in uploads/. Commit your changes; say in your reply when you change memory.",
+].join("\n");
 
 async function ensureConversation(route) {
   const existing = byTopic.get(route.conversationKey);
@@ -490,7 +523,12 @@ async function ensureConversation(route) {
   }
   const docInit =
     route.kind === "dm"
-      ? { stream: route.channel, topic: route.topic, recipients: route.replyRecipients }
+      ? {
+          stream: route.channel,
+          topic: route.topic,
+          recipients: route.replyRecipients,
+          ...(route.person ? { person: route.person } : {}),
+        }
       : { stream: route.stream, topic: route.topic };
   const tools = channelConfig
     .toolsFor(route.channel)
@@ -520,6 +558,83 @@ async function ensureConversation(route) {
   });
   log.info(`conversation created for ${route.conversationKey}: ${created.id}`);
   return created;
+}
+
+// ---------------------------------------------------------------------------
+// Work streams (dm-first memo): task conversations for a person's DM.
+
+function personSlug(person) {
+  const raw = person.name || person.email?.split("@")[0] || "person";
+  return raw.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+}
+
+/** The person's work stream: the channels.json "people" entry wins; an
+ *  owner without one gets an auto-derived "<first-name>-work" stream.
+ *  Fails closed for anyone else (no config, no task delegation). */
+async function workStreamForPerson(person) {
+  const conf = channelConfig.people[person.email];
+  if (conf?.workStream) return conf.workStream;
+  const owner = await isOwner(person.id);
+  if (!owner) return null;
+  return `${personSlug(person)}-work`;
+}
+
+/** run_task's target: resolve the stream, and on first use join it, invite
+ *  the person (they may mute it), provision the shared workspace, and start
+ *  its poller. */
+async function resolveWorkStreamForDoc(doc) {
+  if (!doc?.recipients) return { error: "run_task is for direct messages." };
+  if (!doc.person) {
+    return {
+      error:
+        "No person is attached to this DM (group messages cannot delegate tasks). " +
+        'Add a "people" entry in channels.json for one-on-one use.',
+    };
+  }
+  const stream = await workStreamForPerson(doc.person);
+  if (!stream) {
+    return {
+      error: `No work stream is configured for ${doc.person.email}. Add a "people" entry in channels.json.`,
+    };
+  }
+  workStreamToWorkspace.set(stream, doc.stream);
+  if (!streamQueues.has(stream)) {
+    try {
+      await zulip.subscribeSelf(
+        stream,
+        `Task conversations (family-agent work stream for ${doc.person.email})`
+      );
+    } catch (err) {
+      return { error: `Could not join the work stream "${stream}" (${err.message}).` };
+    }
+    const invited = await zulip
+      .subscribeOthers(stream, [doc.person.email])
+      .catch(() => null);
+    await provisionStream(env, stream, log, workspaceChannelOf(stream)).catch(() => {});
+    startStreamQueue(stream);
+    audit.record("workstream", {
+      stream,
+      person: doc.person.email,
+      invited: invited?.added ?? [],
+    });
+    log.info(`work stream "${stream}" joined for ${doc.person.email}`);
+  }
+  return { stream };
+}
+
+/** The agent a task conversation starts with: the work stream's tool list,
+ *  the strong model only when the front conversation pinned it. */
+function taskAgentFor(stream, mode) {
+  const strong = mode === "strong";
+  return {
+    model: MODEL_ALIASES[strong ? "strong" : "flash"],
+    thinkingLevel: strong ? "high" : "low",
+    instructions: INSTRUCTIONS,
+    tools: channelConfig
+      .toolsFor(stream)
+      .map((name) => toolByName.get(name))
+      .filter(Boolean),
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -566,6 +681,8 @@ function argSummary(toolName, args) {
       return String(a.query ?? "").slice(0, 90);
     case "history_search":
       return String(a.query ?? "").slice(0, 90);
+    case "run_task":
+      return String(a.topic ?? "");
     case "summarize_url":
       return String(a.url ?? "").slice(0, 90);
     case "spawn_thread":
@@ -579,6 +696,7 @@ function argSummary(toolName, args) {
 async function postSpoiler(conversationId, toolName, args, resultText) {
   const mapping = byId.get(conversationId);
   if (!mapping) return;
+  if (watchers.get(conversationId)?.quiet) return; // gateway-initiated passes
   const header = `${toolName} — ${argSummary(toolName, args)}`.slice(0, 80);
   const body = (resultText || "(no output)").slice(0, SPOILER_RESULT_LIMIT);
   const content = "```spoiler " + header + "\n" + body + "\n```";
@@ -910,7 +1028,7 @@ async function classifyEditEvent(event, messageId, hasContent) {
     if (!m || (botUserId !== null && m.sender_id === botUserId)) return null;
     const route =
       m.type === "private" ? dmRoute(m) : streamRoute(m.display_recipient, m.subject);
-    await provisionStream(env, route.channel, log);
+    await provisionStream(env, route.channel, log, workspaceChannelOf(route.channel));
     // raw_content is the markdown source; fall back to what the event or
     // GET returned (rendered) when the policy does not expose it.
     const freshMessage = {
@@ -1077,6 +1195,62 @@ async function extractAnswer(conversation, settled) {
   return text || "*(the run finished without text — check the gateway logs)*";
 }
 
+// ---------------------------------------------------------------------------
+// Gateway-initiated turns (scheduled passes, task-done reports)
+
+/** A DM route rebuilt from a stored dm channel key, for proactive turns. */
+function dmRouteForChannel(dmChannel) {
+  const conversationId = byTopic.get(`dm::${dmChannel}`);
+  const mapping = conversationId ? byId.get(conversationId) : null;
+  if (!mapping?.recipients) return null;
+  return {
+    kind: "dm",
+    stream: dmChannel,
+    topic: dmChannel,
+    conversationKey: `dm::${dmChannel}`,
+    channel: dmChannel,
+    replyRecipients: mapping.recipients,
+    reply: (content) => zulip.sendPrivateMessage(mapping.recipients, content),
+  };
+}
+
+/** Submit a gateway-initiated prompt and return its answer text. The
+ *  requestId makes a restart rerun idempotent (same id, same submission).
+ *  Spoilers stay quiet while it runs: these turns are internal bookkeeping,
+ *  not the person's requests. */
+async function runGatewayPrompt(route, content, requestId) {
+  const conversation = await ensureConversation(route);
+  await ensureWatcher(conversation.id);
+  const state = watchers.get(conversation.id);
+  if (state) state.quiet = true;
+  try {
+    const submission = await conversation.submit(
+      { type: "input", content, requestId, whenBusy: "followUp" },
+      context
+    );
+    const settled = await submission.wait(context);
+    return extractAnswer(conversation, settled);
+  } finally {
+    if (state) state.quiet = false;
+  }
+}
+
+// Proactivity budget: agent-initiated posts to a person's DM are capped per
+// rolling hour, so a bug (or an injected instruction) cannot text-storm.
+const PROACTIVE_LIMIT = Number(process.env.PROACTIVE_LIMIT_PER_HOUR) || 8;
+const proactiveStamps = new Map(); // dm channel -> [ms]
+function allowProactive(dmChannel) {
+  const now = Date.now();
+  const recent = (proactiveStamps.get(dmChannel) ?? []).filter((t) => now - t < 3600_000);
+  if (recent.length >= PROACTIVE_LIMIT) {
+    audit.record("proactive-limited", { channel: dmChannel });
+    return false;
+  }
+  recent.push(now);
+  proactiveStamps.set(dmChannel, recent);
+  return true;
+}
+
 /** Spawned threads run outside any tool invocation: the gateway submits and posts. */
 const threadRuns = new Set();
 
@@ -1110,6 +1284,31 @@ async function runSpawnedThread(conversationId, mapping) {
       await zulip.sendStreamMessage(mapping.stream, mapping.topic, answer)
     );
     log.info(`thread reply posted (${answer.length} chars) -> ${mapping.stream}::${mapping.topic}`);
+    // A background task delegated from a DM reports back there (dm-first
+    // memo: fire-and-forget results arrive as proactive messages).
+    if (mapping.notify?.dmChannel && allowProactive(mapping.notify.dmChannel)) {
+      const route = dmRouteForChannel(mapping.notify.dmChannel);
+      if (route) {
+        try {
+          const note =
+            `(system note, not from the user) A background task just finished: ` +
+            `topic "${mapping.topic}" in ${mapping.stream}. Its answer:\n\n` +
+            `${answer.slice(0, 1500)}\n\n` +
+            `Tell the user the result now, briefly, in your own words. ` +
+            `Include the topic name and any file links it produced.`;
+          const reply = await runGatewayPrompt(route, note, `taskdone:${conversationId}`);
+          if (reply && !reply.startsWith("*(no answer")) {
+            await recordTailPost(
+              byTopic.get(route.conversationKey),
+              await zulip.sendPrivateMessage(route.replyRecipients, reply)
+            );
+            log.info(`task-done report posted -> ${route.conversationKey}`);
+          }
+        } catch (err) {
+          log.error(`task-done report failed: ${err.message}`);
+        }
+      }
+    }
   } catch (err) {
     log.error(`thread reply failed: ${err.message}`);
     zulip
@@ -1349,6 +1548,56 @@ async function handleCommand(route, content) {
       );
       return true;
     }
+    case "tasks": {
+      // Which stream's topics to list: the person's work stream in a DM,
+      // this stream's own topics otherwise.
+      let stream = route.kind === "dm" ? null : route.stream;
+      if (route.kind === "dm") {
+        const conversationId = byTopic.get(route.conversationKey);
+        const doc = conversationId
+          ? await harness.snapshot(ZulipDoc, conversationId, context)
+          : null;
+        stream = doc?.person ? await workStreamForPerson(doc.person) : null;
+      }
+      if (!stream) {
+        await say("No work stream for this conversation yet — delegate a job first.");
+        return true;
+      }
+      const prefix = `${stream}::`;
+      const runningTopics = new Set(
+        [...threadRuns]
+          .map((id) => byId.get(id))
+          .filter((m) => m && m.stream === stream)
+          .map((m) => m.topic)
+      );
+      const topics = [...byTopic.keys()]
+        .filter((k) => k.startsWith(prefix))
+        .map((k) => k.slice(prefix.length))
+        .slice(-15)
+        .map((t) => `- ${t}${runningTopics.has(t) ? " *(running)*" : ""}`);
+      await say(
+        topics.length
+          ? `Task topics in #${stream}:\n${topics.join("\n")}`
+          : `No task topics in #${stream} yet.`
+      );
+      return true;
+    }
+    case "memory": {
+      // Memory transparency (dm-first memo): the person can read what is
+      // remembered. These are their own conversation's memory files.
+      const dir = workspaceDir(env, workspaceChannelOf(route.channel));
+      const files = [
+        ["user", path.join(dir, "memory", "user.md")],
+        ["channel", path.join(dir, "memory", "channels", `${route.channel}.md`)],
+      ];
+      const parts = [];
+      for (const [label, file] of files) {
+        const text = await readFile(file, "utf8").catch(() => null);
+        if (text && text.trim()) parts.push(`**${label} memory**\n\n${text.trim()}`);
+      }
+      await say(parts.length ? parts.join("\n\n---\n\n") : "No memory yet for this conversation.");
+      return true;
+    }
     case "model": {
       const parts = argStr.split(/\s+/).filter(Boolean);
       if (parts.length === 0) {
@@ -1464,6 +1713,7 @@ async function routeGeneralChat(message) {
 // Zulip wiring
 
 let botUserId = null;
+let botEmail = null;
 
 async function onStreamMessage(message) {
   const stream = message.display_recipient;
@@ -1560,7 +1810,7 @@ async function discoverStreams() {
       startStreamQueue(stream);
       continue;
     }
-    await provisionStream(env, stream, log);
+    await provisionStream(env, stream, log, workspaceChannelOf(stream));
     startStreamQueue(stream);
     log.info(`watching discovered channel "${stream}"`);
   }
@@ -1572,7 +1822,7 @@ async function handleSubscriptionEvent(event) {
     for (const sub of event.subscriptions ?? []) {
       const stream = sub.name;
       if (streamQueues.has(stream) || channelConfig.streams.includes(stream)) continue;
-      await provisionStream(env, stream, log);
+      await provisionStream(env, stream, log, workspaceChannelOf(stream));
       startStreamQueue(stream);
       zulip
         .sendStreamMessage(
@@ -1726,6 +1976,56 @@ function pollLoop() {
 }
 
 // ---------------------------------------------------------------------------
+// Scheduled proactivity (dm-first memo): one nightly memory-consolidation
+// pass per person's front conversation. The pass proposes edits in its
+// reply (it does not write memory itself, so no ask fires overnight); a
+// "nothing" answer is not posted. The requestId dedups a restart mid-pass.
+
+const CONSOLIDATE_HOUR = Number(process.env.CONSOLIDATE_HOUR ?? 5);
+const CONSOLIDATION_PROMPT = [
+  "(scheduled nightly pass, not from the user) This is the memory-consolidation pass.",
+  "Look over this conversation's recent turns and the workspace for durable facts about the user that are not yet in memory/.",
+  "If there are some, reply with a short list of proposed memory edits (quote the exact lines you would add or change) and ask the user to confirm them.",
+  "Do not edit memory yourself on this pass.",
+  "If there is nothing worth persisting, reply with exactly: (nothing to consolidate)",
+].join(" ");
+const consolidatedOn = new Map(); // dm channel -> date string
+
+setInterval(async () => {
+  const now = new Date();
+  if (now.getHours() !== CONSOLIDATE_HOUR) return;
+  const date = now.toISOString().slice(0, 10);
+  for (const key of [...byTopic.keys()]) {
+    if (!key.startsWith("dm::")) continue;
+    const dmChannel = key.slice(5);
+    if (consolidatedOn.get(dmChannel) === date) continue;
+    consolidatedOn.set(dmChannel, date);
+    const conversationId = byTopic.get(key);
+    const doc = conversationId
+      ? await harness.snapshot(ZulipDoc, conversationId, context).catch(() => null)
+      : null;
+    if (!doc?.person) continue; // person front conversations only
+    try {
+      const route = dmRouteForChannel(dmChannel);
+      if (!route) continue;
+      const answer = await runGatewayPrompt(
+        route,
+        CONSOLIDATION_PROMPT,
+        `consolidate:${dmChannel}:${date}`
+      );
+      const trimmed = (answer || "").trim();
+      if (!trimmed || trimmed.startsWith("(nothing") || trimmed.startsWith("*(no answer")) continue;
+      if (allowProactive(dmChannel)) {
+        await recordTailPost(conversationId, await route.reply(trimmed));
+        log.info(`consolidation posted for ${dmChannel}`);
+      }
+    } catch (err) {
+      log.warn(`consolidation failed for ${dmChannel}: ${err.message}`);
+    }
+  }
+}, 5 * 60_000).unref();
+
+// ---------------------------------------------------------------------------
 // Idle sweep: stop watchers, remove exec containers
 
 setInterval(async () => {
@@ -1760,12 +2060,59 @@ setInterval(async () => {
 
 // ---------------------------------------------------------------------------
 
+/** DM conversations created before this deploy: backfill the person
+ *  field, and bring tool list and instructions up to the current
+ *  front-conversation configuration (they are fixed at creation). */
+async function migrateDmDocs() {
+  for (const [key, conversationId] of [...byTopic.entries()]) {
+    if (!key.startsWith("dm::")) continue;
+    const doc = await harness.snapshot(ZulipDoc, conversationId, context);
+    if (!doc?.recipients) continue;
+    if (!doc.person) {
+      const idMatch = /^dm-(\d+)$/.exec(doc.stream);
+      const others = (doc.recipients || []).filter((e) => e !== botEmail);
+      if (idMatch && others.length === 1) {
+        const person = { id: Number(idMatch[1]), email: others[0], name: null };
+        await harness.commit(async (tx) => {
+          (await tx.doc(ZulipDoc, conversationId)).person = person;
+        }, context);
+        log.info(`person backfilled for ${doc.stream}: ${person.email}`);
+      }
+    }
+    const conversation = await harness.conversation(conversationId, context);
+    if (!conversation) continue;
+    const tools = channelConfig
+      .toolsFor(doc.stream)
+      .map((name) => toolByName.get(name))
+      .filter(Boolean);
+    await conversation.configure({ instructions: INSTRUCTIONS_DM, tools }, context);
+  }
+}
+
+/** Boot pass: register every person's work stream -> its DM workspace, so
+ *  task conversations share the person's files across restarts. */
+async function resolvePersonStreams() {
+  for (const [key, conversationId] of [...byTopic.entries()]) {
+    if (!key.startsWith("dm::")) continue;
+    const doc = await harness.snapshot(ZulipDoc, conversationId, context);
+    if (!doc?.person) continue;
+    const stream = await workStreamForPerson(doc.person);
+    if (stream) workStreamToWorkspace.set(stream, doc.stream);
+  }
+  if (workStreamToWorkspace.size > 0) {
+    log.info(`work streams: ${[...workStreamToWorkspace.entries()].map(([s, w]) => `${s} -> ${w}`).join(", ")}`);
+  }
+}
+
 async function main() {
   const me = await zulip.getMe();
   botUserId = me.user_id;
+  botEmail = me.email;
   log.info(`gateway bot: ${me.full_name} <${me.email}> (user_id ${botUserId})`);
   audit.record("boot", { bot: me.email, pid: process.pid });
   await cacheOwnerIds();
+  await migrateDmDocs();
+  await resolvePersonStreams();
   if (env.ZULIP_OWNER_EMAILS.length > 0 && ownerIds.size === 0) {
     log.warn(
       "no owner ids resolved: permission asks will post but can never be approved " +

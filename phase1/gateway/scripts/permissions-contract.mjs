@@ -96,6 +96,85 @@ const rules = new PermissionRules({
   ok("merge: channel overrides global per key, other keys keep both");
 }
 
+// --- path rules (the memory gate) ------------------------------------------
+
+{
+  const memoryRules = new PermissionRules({
+    paths: {
+      write: { "memory/*": "ask", "memory/channels/*": "deny" }, // last wins
+      edit: { "memory/*": "ask" },
+    },
+  });
+  assert.deepEqual(
+    memoryRules.classifyCall({ name: "write", arguments: { path: "memory/user.md" } }),
+    { decision: "ask", rule: "memory/*" }
+  );
+  assert.deepEqual(
+    memoryRules.classifyCall({ name: "edit", arguments: { path: "memory/user.md" } }),
+    { decision: "ask", rule: "memory/*" }
+  );
+  assert.deepEqual(
+    memoryRules.classifyCall({
+      name: "write",
+      arguments: { path: "memory/channels/scratch.md" },
+    }),
+    { decision: "deny", rule: "memory/channels/*" }
+  );
+  assert.deepEqual(
+    memoryRules.classifyCall({ name: "write", arguments: { path: "notes/x.md" } }),
+    { decision: "allow", rule: null }
+  );
+  assert.deepEqual(
+    memoryRules.classifyCall({ name: "write", arguments: {} }),
+    { decision: "allow", rule: null }
+  );
+  // a path rule does not shadow an unrelated tool rule: read stays free
+  assert.deepEqual(
+    memoryRules.classifyCall({ name: "read", arguments: { path: "memory/user.md" } }),
+    { decision: "allow", rule: null }
+  );
+  ok("path rules: memory writes ask, deeper rule wins, other paths allow");
+}
+{
+  const merged = mergePermissionConfig(
+    { paths: { write: { "memory/*": "ask" } } },
+    { paths: { write: { "memory/drafts/*": "allow" } } }
+  );
+  assert.equal(merged.paths.write["memory/*"], "ask");
+  assert.equal(merged.paths.write["memory/drafts/*"], "allow");
+  ok("merge: channel path rules overlay global ones");
+}
+
+// --- channel config (tools, dm fallback, people) ----------------------------
+
+{
+  const { ChannelConfig } = await import("../lib/channels.js");
+  const config = new ChannelConfig({
+    streams: ["scratch", "meta"],
+    channels: {
+      meta: { add: ["push_changes"] },
+      dm: { permissions: { tools: { push_changes: "deny" } } },
+      "dm-1-2": {},
+    },
+    people: { "a@example.com": { workStream: "a-work" } },
+  });
+  // DMs get run_task on top of the standard set; streams do not
+  assert.equal(config.toolsFor("dm-1").includes("run_task"), true);
+  assert.equal(config.toolsFor("dm-1").includes("push_changes"), false);
+  assert.equal(config.toolsFor("meta").includes("run_task"), false);
+  assert.equal(config.toolsFor("meta").includes("push_changes"), true);
+  // the shared dm block configures every dm channel; a specific dm channel
+  // can still override it
+  assert.equal(config.permissionConfigFor("dm-7").tools.push_changes, "deny");
+  assert.equal(config.permissionConfigFor("dm-1-2").tools.push_changes, "deny");
+  assert.deepEqual(
+    config.permissionConfigFor("scratch").tools.push_changes,
+    undefined
+  );
+  assert.equal(config.people["a@example.com"].workStream, "a-work");
+  ok("channel config: dm tool set, dm permission fallback, people entries");
+}
+
 // --- the ask flow ------------------------------------------------------------
 
 const OWNER_ID = 99;

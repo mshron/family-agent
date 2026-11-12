@@ -4,6 +4,14 @@
     "bash": {
       "rm -rf /*": "deny",
       "sudo *": "deny"
+    },
+    "paths": {
+      "write": {
+        "memory/*": "ask"
+      },
+      "edit": {
+        "memory/*": "ask"
+      }
     }
   },
   "channels": {
@@ -18,5 +26,6 @@
       }
     },
     "dm": {}
-  }
+  },
+  "people": {}
 }

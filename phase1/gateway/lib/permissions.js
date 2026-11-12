@@ -19,6 +19,12 @@
 //   - "bash": { "<wildcard pattern>": "allow|ask|deny", ... } — patterns use
 //     `*` (matches anything, including across words); last matching wins,
 //     so put catch-alls first. Unmatched commands are allowed.
+//   - "paths": { "<tool-name>": { "<wildcard pattern>": "allow|ask|deny" } }
+//     — path-scoped rules for tools that take a `path` argument (write,
+//     edit), matched like bash patterns. This is the memory gate: memory
+//     files are persistent prompt content, so writes to memory/* ask. A
+//     bash write to memory bypasses this surface (a residual gap, noted in
+//     the dm-first memo); the gate is tamper-evidence, not a hard boundary.
 //   - A per-channel "permissions" block is merged over a top-level global
 //     one, surface by surface.
 //
@@ -60,11 +66,18 @@ export function patternToRegExp(pattern) {
   return new RegExp(`^${escaped}$`, "s");
 }
 
-/** Merge a global and a channel permission block; the channel wins per key. */
+/** Merge a global and a channel permission block; the channel wins per key.
+ *  Path rules merge per tool and per pattern (a channel rule for one path
+ *  does not erase the global rules for other paths of the same tool). */
 export function mergePermissionConfig(global = {}, channel = {}) {
+  const paths = {};
+  for (const tool of new Set([...Object.keys(global.paths ?? {}), ...Object.keys(channel.paths ?? {})])) {
+    paths[tool] = { ...(global.paths?.[tool] ?? {}), ...(channel.paths?.[tool] ?? {}) };
+  }
   return {
     tools: { ...(global.tools ?? {}), ...(channel.tools ?? {}) },
     bash: { ...(global.bash ?? {}), ...(channel.bash ?? {}) },
+    paths,
   };
 }
 
@@ -76,6 +89,15 @@ export class PermissionRules {
       pattern,
       decision,
     }));
+    // tool name -> [{ re, pattern, decision }], same wildcard style as bash.
+    this.paths = {};
+    for (const [tool, patterns] of Object.entries(config.paths ?? {})) {
+      this.paths[tool] = Object.entries(patterns ?? {}).map(([pattern, decision]) => ({
+        re: patternToRegExp(pattern),
+        pattern,
+        decision,
+      }));
+    }
   }
 
   classifyTool(name) {
@@ -102,10 +124,28 @@ export class PermissionRules {
     return { decision, rule };
   }
 
+  /** Path-scoped rules for one tool call with a `path` argument. */
+  classifyPaths(name, path) {
+    const rules = this.paths[name];
+    if (!rules || typeof path !== "string") return { decision: "allow", rule: null };
+    let decision = "allow";
+    let rule = null;
+    for (const { re, pattern, decision: d } of rules) {
+      if (re.test(path)) {
+        decision = d;
+        rule = pattern;
+      }
+    }
+    return { decision, rule };
+  }
+
   classifyCall(call) {
     if (call?.name === "bash") {
       return this.classifyBash(String(call.arguments?.command ?? ""));
     }
+    // Path rules first (they carry the location context), then tool rules.
+    const byPath = this.classifyPaths(call?.name ?? "", call?.arguments?.path);
+    if (byPath.decision !== "allow") return byPath;
     return this.classifyTool(call?.name ?? "");
   }
 }
