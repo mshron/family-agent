@@ -214,6 +214,12 @@ const historySearchTool = defineTool({
   },
 });
 
+// Upstream provider failures can arrive as the model's own output (a
+// completed message whose text is the error), bypassing the harness's retry
+// classification. Same shape test the gateway uses before posting replies.
+const PROVIDER_ERROR_RE =
+  /^(Error calling LLM|litellm\.|OpenAIException|Error code: [45]\d\d|API error|Rate limit)/i;
+
 // ---------------------------------------------------------------------------
 // Threads: fork this conversation, or spawn a fresh subagent thread.
 
@@ -310,6 +316,15 @@ export function buildZulipTools({
             ? contentText(message.content).trim()
             : "";
         }, context);
+        // A provider failure can arrive as the task's own output (upstream
+        // 5xx wrapped in a completed message); the raw text must not be
+        // relayed into the person's thread.
+        if (PROVIDER_ERROR_RE.test(answer.slice(0, 200))) {
+          return err(
+            `Task "${topic}" hit a model-service error and did not complete. ` +
+            `Tell the user it failed, and offer to run it again.`
+          );
+        }
         return {
           content: [
             {

@@ -928,6 +928,12 @@ async function runEditedTurn(conversation, route, { messageId, editTimestamp, co
     }
     const answer = await extractAnswer(conversation, settled);
     if (!answer) return; // aborted: silent
+    if (looksLikeProviderError(answer)) {
+      log.error(`provider error as edited reply (${route.conversationKey}): ${answer.slice(0, 300)}`);
+      audit.record("provider-error", { channel: route.channel, text: answer.slice(0, 300) });
+      await recordTailPost(conversation.id, await route.reply(MODEL_FAILED_NOTICE));
+      return;
+    }
     const reply =
       answer.length > REPLY_CHAR_LIMIT
         ? `${answer.slice(0, REPLY_CHAR_LIMIT)}\n\n*(truncated — the full text is in the workspace)*`
@@ -1279,11 +1285,20 @@ async function runSpawnedThread(conversationId, mapping) {
     const settled = await submission.wait(context);
     const answer = await extractAnswer(conversation, settled);
     if (!answer) return; // aborted: silent
+    // A provider error that came through as the task's output: post the
+    // notice, and let the DM report say the task failed (the person who
+    // started it should know).
+    let reportText = answer;
+    if (looksLikeProviderError(answer)) {
+      log.error(`provider error as thread reply (${mapping.stream}::${mapping.topic}): ${answer.slice(0, 300)}`);
+      audit.record("provider-error", { channel: mapping.stream, text: answer.slice(0, 300) });
+      reportText = MODEL_FAILED_NOTICE;
+    }
     await recordTailPost(
       conversationId,
-      await zulip.sendStreamMessage(mapping.stream, mapping.topic, answer)
+      await zulip.sendStreamMessage(mapping.stream, mapping.topic, reportText)
     );
-    log.info(`thread reply posted (${answer.length} chars) -> ${mapping.stream}::${mapping.topic}`);
+    log.info(`thread reply posted (${reportText.length} chars) -> ${mapping.stream}::${mapping.topic}`);
     // A background task delegated from a DM reports back there (dm-first
     // memo: fire-and-forget results arrive as proactive messages).
     if (mapping.notify?.dmChannel && allowProactive(mapping.notify.dmChannel)) {
@@ -1293,9 +1308,10 @@ async function runSpawnedThread(conversationId, mapping) {
           const note =
             `(system note, not from the user) A background task just finished: ` +
             `topic "${mapping.topic}" in ${mapping.stream}. Its answer:\n\n` +
-            `${answer.slice(0, 1500)}\n\n` +
+            `${reportText.slice(0, 1500)}\n\n` +
             `Tell the user the result now, briefly, in your own words. ` +
-            `Include the topic name and any file links it produced.`;
+            `Include the topic name and any file links it produced. If the answer ` +
+            `is a failure notice, say the task failed and offer to run it again.`;
           const reply = await runGatewayPrompt(route, note, `taskdone:${conversationId}`);
           if (reply && !reply.startsWith("*(no answer")) {
             await recordTailPost(
@@ -1349,6 +1365,22 @@ async function ingestUploads(route, message) {
   return out;
 }
 
+// Provider failures can arrive as the model's own output: an upstream
+// gateway (litellm behind OpenRouter) sometimes wraps a 502 in a completed
+// message, so the harness sees a normal answer and its retry policy never
+// engages. Raw error text must not reach a family chat; a transient blip
+// should not put the work on the person either (one automatic retry).
+const PROVIDER_ERROR_RE =
+  /^(Error calling LLM|litellm\.|OpenAIException|Error code: [45]\d\d|API error|Rate limit)/i;
+
+function looksLikeProviderError(text) {
+  return PROVIDER_ERROR_RE.test((text || "").trim().slice(0, 200));
+}
+
+const MODEL_FAILED_NOTICE =
+  "*(the model service failed just now — that message didn't go through; " +
+  "sending it again should work)*";
+
 /** One user message -> one conversation turn, with a thinking indicator. */
 // Place a prompt's durable effect: route it into the harness. This is
 // the part that must not be overtaken by a later /stop (model routing
@@ -1389,8 +1421,47 @@ async function settlePrompt(route, placed, message) {
     log.info(`turn for message ${message.id} superseded by an edit; reply skipped`);
     return;
   }
-  const answer = await extractAnswer(conversation, settled);
+  let answer = await extractAnswer(conversation, settled);
+  // A provider error that came through as the model's output: the harness
+  // never classified it, so retry once automatically before telling the
+  // person anything.
+  if (looksLikeProviderError(answer)) {
+    log.error(`provider error as reply (${route.conversationKey}): ${answer.slice(0, 300)}`);
+    audit.record("provider-error", { channel: route.channel, text: answer.slice(0, 300) });
+    const retryId = `${requestId}:r1`;
+    const already = await harness.commit(
+      (tx) => tx.submissionByRequest(conversation.id, retryId),
+      context
+    );
+    if (!already && !(await isSuperseded(conversation.id, requestId))) {
+      try {
+        const retry = await conversation.submit(
+          {
+            type: "input",
+            content:
+              `(system note, not from the user) The previous reply came back as a provider error ` +
+              `("${answer.slice(0, 120)}") and was not delivered. ` +
+              `Answer the user's last message again, as a normal reply.`,
+            requestId: retryId,
+            whenBusy: "followUp",
+          },
+          context
+        );
+        const settledRetry = await retry.wait(context);
+        answer = await extractAnswer(conversation, settledRetry);
+      } catch (err) {
+        log.error(`provider-error retry failed: ${err.message}`);
+      }
+    } else {
+      answer = ""; // already retried once (a crash rerun): fall through
+    }
+  }
   if (!answer) return; // aborted: silent
+  if (looksLikeProviderError(answer) || answer.startsWith("*(no answer: model_error")) {
+    await recordTailPost(conversation.id, await route.reply(MODEL_FAILED_NOTICE));
+    log.warn(`model failure posted as notice -> ${route.conversationKey}`);
+    return;
+  }
   const reply =
     answer.length > REPLY_CHAR_LIMIT
       ? `${answer.slice(0, REPLY_CHAR_LIMIT)}\n\n*(truncated — the full text is in the workspace)*`
