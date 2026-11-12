@@ -89,62 +89,91 @@ function tokenize(command) {
   return out;
 }
 
-// Card-field detection over snapshot -i output. Autocomplete hints are the
-// reliable signal; name/id/placeholder words are the fallback.
-// Order matters: the specific month/year patterns must claim a line
-// before the generic expiry one. Each line (one input) maps to at most
-// one field.
-const PATTERNS = [
-  ["expMonth", /(cc[ -]?exp[ -]?month|expir[ -]?month|exp[ -]?month)/i],
-  ["expYear", /(cc[ -]?exp[ -]?year|expir[ -]?year|exp[ -]?year)/i],
-  ["exp", /(cc[ -]?exp|card[ -]?exp|expir)/i],
-  ["number", /(cc[ -]?number|card[ -]?number|cardnumber|ccnum)/i],
-  ["cvc", /(cc[ -]?csc|cc[ -]?cvc|cvc|cvv|security[ -]?code)/i],
-  ["name", /(cc[ -]?name|card[ -]?name|name[ -]?on[ -]?card)/i],
-];
-
-function cardFields(snapshotText) {
-  const fields = {};
-  for (const line of String(snapshotText).split("\n")) {
-    // Snapshot lines look like: - textbox "Card number" [ref=e1]
-    const m = line.match(/\[ref=(e\d+)\]/);
-    if (!m) continue;
-    const ref = m[1];
-    const low = line.toLowerCase();
-    for (const [field, re] of PATTERNS) {
-      if (re.test(low)) {
-        if (!fields[field]) fields[field] = ref;
-        break; // one input, one field
-      }
-    }
+// Card fill runs as page JavaScript: detection on real attributes
+// (autocomplete hints first, name/id/placeholder fallbacks), values set
+// via the native property setter + input/change events so framework forms
+// (React et al.) register them. The eval script carries the card values
+// and lives only inside this container; the result is labels only.
+function fillCardScript() {
+  const c = {
+    number: CARD.number,
+    cvc: CARD.cvc,
+    name: CARD.name,
+    exp: CARD.expMonth && CARD.expYear ? `${CARD.expMonth}/${CARD.expYear}` : "",
+    expMonth: CARD.expMonth,
+    expYear: CARD.expYear,
+  };
+  return `
+(function () {
+  var values = ${JSON.stringify(c)};
+  var rx = {
+    number: /(cc|card)[- _]?number|cardnumber|ccnum/i,
+    cvc: /(^|[^a-z])(cvc|cvv)|cc-?cs|security[ _]?code|card[ _]?verification/i,
+    expMonth: /exp(ir(ation|y)?)?[ _-]?month|cc-?exp-?month/i,
+    expYear: /exp(ir(ation|y)?)?[ _-]?year|cc-?exp-?year/i,
+    exp: /exp(ir(ation|y)?)?([ _-]?(date|field))?$|mm[ \/]?yy/i,
+    name: /cc-?name|card[ _]?name|name[ _]?on[ _]?card|cardholder/i,
+  };
+  function label(el) {
+    return (el.getAttribute("autocomplete") || el.name || el.id || el.getAttribute("placeholder") || "field").slice(0, 30);
   }
-  return fields;
+  function set(el, value) {
+    if (!value) return false;
+    var proto = Object.getPrototypeOf(el);
+    var desc = Object.getOwnPropertyDescriptor(proto, "value");
+    if (desc && desc.set) desc.set.call(el, value); else el.value = value;
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+    el.dispatchEvent(new Event("change", { bubbles: true }));
+    return true;
+  }
+  var found = {};
+  var fields = { number: null, cvc: null, expMonth: null, expYear: null, exp: null, name: null };
+  var els = document.querySelectorAll("input, select");
+  for (var i = 0; i < els.length; i++) {
+    var el = els[i];
+    if (el.disabled || el.readOnly) continue;
+    var attrs = [el.getAttribute("autocomplete"), el.name, el.id, el.getAttribute("placeholder"), el.getAttribute("aria-label")].join(" ");
+    var ac = (el.getAttribute("autocomplete") || "").toLowerCase();
+    if (ac === "cc-number" || (!fields.number && rx.number.test(attrs))) fields.number = el;
+    if (/^cc-csc$|^cc-cvc$/.test(ac) || (!fields.cvc && rx.cvc.test(attrs))) fields.cvc = el;
+    if (ac === "cc-exp-month" || (!fields.expMonth && rx.expMonth.test(attrs))) fields.expMonth = el;
+    if (ac === "cc-exp-year" || (!fields.expYear && rx.expYear.test(attrs))) fields.expYear = el;
+    if (ac === "cc-exp" || (!fields.exp && !rx.expMonth.test(attrs) && !rx.expYear.test(attrs) && rx.exp.test(attrs))) fields.exp = el;
+    if (ac === "cc-name" || (!fields.name && rx.name.test(attrs))) fields.name = el;
+  }
+  var filled = [];
+  if (fields.number) { set(fields.number, values.number) && filled.push(label(fields.number)); }
+  if (fields.cvc) { set(fields.cvc, values.cvc) && filled.push(label(fields.cvc)); }
+  if (fields.expMonth) { set(fields.expMonth, values.expMonth) && filled.push(label(fields.expMonth)); }
+  if (fields.expYear) { set(fields.expYear, values.expYear) && filled.push(label(fields.expYear)); }
+  if (!fields.expMonth && !fields.expYear && fields.exp) { set(fields.exp, values.exp) && filled.push(label(fields.exp)); }
+  if (fields.name) { set(fields.name, values.name) && filled.push(label(fields.name)); }
+  return JSON.stringify({ filled: filled });
+})()`;
 }
 
 async function handleFillCard(key) {
-  const snap = await runCli(key, ["snapshot", "-i"]);
-  const fields = cardFields(snap.output);
-  if (!fields.number) {
-    return { ok: true, filled: [], output: redact(snap.output).slice(0, 1500), note: "no card fields detected on this page — navigate to the payment form first" };
-  }
   if (!CARD.number) {
     return { ok: false, filled: [], output: "", note: "no card configured on the vault (CARD_NUMBER unset)" };
   }
-  const filled = [];
-  const fill = async (ref, value, label) => {
-    const r = await runCli(key, ["fill", ref, value]);
-    if (r.code === 0) filled.push(label);
-  };
-  await fill(fields.number, CARD.number, "card number");
-  if (fields.cvc && CARD.cvc) await fill(fields.cvc, CARD.cvc, "cvc");
-  if (fields.name && CARD.name) await fill(fields.name, CARD.name, "name on card");
-  if (fields.exp && CARD.expMonth && CARD.expYear) {
-    await fill(fields.exp, `${CARD.expMonth}/${CARD.expYear}`, "expiry");
-  } else {
-    if (fields.expMonth && CARD.expMonth) await fill(fields.expMonth, CARD.expMonth, "expiry month");
-    if (fields.expYear && CARD.expYear) await fill(fields.expYear, CARD.expYear, "expiry year");
+  const script = fillCardScript();
+  const r = await runCli(key, ["eval", "-b", Buffer.from(script).toString("base64")]);
+  let filled = [];
+  let note = "";
+  try {
+    const m = (r.output || "").match(/\{[^]*\}/);
+    if (m) filled = JSON.parse(m[0]).filled || [];
+  } catch {
+    /* fall through */
   }
-  return { ok: true, filled, output: "", note: `filled: ${filled.join(", ") || "none"}` };
+  if (r.code !== 0 || filled.length === 0) {
+    note = filled.length === 0 && r.code === 0
+      ? "no card fields detected on this page — some merchants embed card fields in a provider's cross-origin iframe, which cannot be filled; tell the user if so"
+      : "card fill failed: " + redact(r.output).slice(0, 200);
+  } else {
+    note = "filled: " + filled.join(", ");
+  }
+  return { ok: r.code === 0 && filled.length > 0, filled, output: "", note };
 }
 
 const json = (res, status, data) => {
