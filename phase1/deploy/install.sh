@@ -8,10 +8,6 @@ if [ ! -f .env ]; then
   echo "ERROR: /opt/family-agent/.env is missing (push secrets first)" >&2
   exit 1
 fi
-if [ ! -f proxy.env ]; then
-  echo "ERROR: /opt/family-agent/proxy.env is missing (fa-proxy's keys; see deploy/push-secrets.sh)" >&2
-  exit 1
-fi
 source .env
 
 if ! command -v jq >/dev/null 2>&1; then
@@ -64,7 +60,9 @@ echo "building exec image..."
 docker build -q -t family-agent-exec:latest phase1/exec
 
 echo "starting gateway..."
-docker compose -f phase1/deploy/docker-compose.yml up -d --build
+# --remove-orphans retires services that moved off this box (the credential
+# proxy went to the vault box in the two-box split).
+docker compose -f phase1/deploy/docker-compose.yml up -d --build --remove-orphans
 # up -d alone does not restart a container whose image is unchanged (for
 # example when only channels.json changed); the config is read at boot.
 docker compose -f phase1/deploy/docker-compose.yml restart gateway

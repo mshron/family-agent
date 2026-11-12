@@ -19,6 +19,10 @@ set -euo pipefail
 
 REMOTE_HOST=root@128.140.54.129
 REMOTE_DIR=/opt/family-agent
+# The vault box (trusted half of the two-box split) — receives proxy.env.
+# The trusted machine that holds fa-proxy and the backups; NOT the session
+# box. Set this to the vault box's IP before running.
+VAULT_HOST=""
 PENV="$HOME/Documents/Research/polynumeral-assistant/.env"
 
 # Your Zulip email(s), comma-separated: the bot adds you to streams it
@@ -114,6 +118,7 @@ KAGI_API_KEY=$KAGI_API_KEY
 BRAVE_API_KEY=$BRAVE_API_KEY
 EOF
 
+[ -n "$VAULT_HOST" ] || { echo "ERROR: VAULT_HOST is empty — set it to the vault box's IP first" >&2; exit 1; }
 ssh "$REMOTE_HOST" "mkdir -p $REMOTE_DIR && cat > $REMOTE_DIR/.env && chmod 600 $REMOTE_DIR/.env" < "$OUT"
-ssh "$REMOTE_HOST" "cat > $REMOTE_DIR/proxy.env && chmod 600 $REMOTE_DIR/proxy.env" < "$OUT.penv"
+ssh "$VAULT_HOST" "mkdir -p $REMOTE_DIR && cat > $REMOTE_DIR/proxy.env && chmod 600 $REMOTE_DIR/proxy.env" < "$OUT.penv"
 echo "wrote $REMOTE_HOST:$REMOTE_DIR/.env (search: $SEARCH_PROVIDER)"
