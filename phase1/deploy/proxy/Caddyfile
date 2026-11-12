@@ -1,19 +1,18 @@
-# Credential proxy (Phase 2). Deployed as fa-proxy by docker-compose on the
-# gateway box; keys live only in /opt/family-agent/proxy.env (mode 600),
-# never in the gateway's .env and never in any exec container.
+# Credential proxy (Phase 2), deployed as fa-proxy on the vault box — the
+# trusted half of the two-box split. Keys live only in that box's
+# /opt/family-agent/proxy.env (mode 600); the session box (10.0.0.3, the
+# gateway and exec containers) holds no upstream credentials at all, so a
+# full compromise of it reaches no key material. The port listens on the
+# private network only; bootstrap.sh firewalls it to the session box.
 #
 # Routes (prefix stripped, upstream path prepended):
-#   /llm/*   -> https://openrouter.ai/api/v1/*   (LLM_BASE_URL=http://fa-proxy:8080/llm)
+#   /llm/*   -> https://openrouter.ai/api/v1/*   (LLM_BASE_URL=http://10.0.0.4:8080/llm)
 #   /kagi/*  -> https://kagi.com/api/v2/*        (search + summarize)
 #   /brave/* -> https://api.search.brave.com/res/v1/* (web search)
 # Callers send no Authorization header; the proxy replaces it upstream.
 #
-# Single-box note (deviation from phase2-hardening.md, 12 Nov): activated on
-# the session box before the two-box split. The gateway process is trusted
-# either way; the property that ships now is that key material stops living
-# in the process environment of anything that talks to the untrusted half
-# of the network, and Phase 3 open-world responses get a checkpoint here.
-# Moving the proxy to a gateway box later changes one env var (the URL).
+# Phase 3: open-world responses (fetch, email bodies) get their ingress
+# scanning checkpoint here.
 #
 # Known exception (by design, see phase1/exec/mark): the mark sidecar token
 # is not proxied — its viewer URL carries the token into conversations by

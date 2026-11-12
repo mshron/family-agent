@@ -1,0 +1,14 @@
+# fa-proxy on the vault box (trusted half of the two-box split). Keys live
+# in ./proxy.env (mode 600) on that box alone; nothing else runs there.
+# The port is published on the private-network IP only, and host iptables
+# (bootstrap.sh) restricts it to the session box's private IP.
+services:
+  proxy:
+    image: caddy:2
+    container_name: fa-proxy
+    restart: unless-stopped
+    env_file: /opt/family-agent/proxy.env
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+    ports:
+      - "10.0.0.4:8080:8080"
