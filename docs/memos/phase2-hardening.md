@@ -53,6 +53,36 @@ box itself:
    (`phase1/exec/mark`); fronting only the registration call would change
    nothing. A real fix means sidecar sessions — deferred.
 
+## Design conclusions recorded from the split discussion (12 Nov, evening)
+
+1. **Capability-channel exfiltration is the residual risk that stays.** A
+   hijacked agent can always misuse its own capabilities — make a tarball,
+   send it through the sanctioned email tool. The network cannot fix this;
+   the tool layer does: outbound-send as a policy point (volume caps,
+   attachment inspection, ask-gating for bulk sends — the wife's profile
+   already specifies outbound-send always-human), rate limits, and ingress
+   scanning at the proxy to catch the injected instruction upstream. Our
+   tools execute gateway-side rather than as MCP servers inside sessions,
+   so the inspection point is one chokepoint, not N self-attesting servers.
+2. **Sessions get no direct network world at all.** Search and fetches run
+   gateway-side and pass through the proxy's checkpoint; the session's own
+   egress shrinks to DNS, package registries, and the trusted box. Ingress
+   for a session is tool results — the controlled path.
+3. **The split's pragmatic shape: move the proxy, not the gateway.**
+   pi-durable made the gateway process the session runtime; moving it off
+   the session box means a shared-storage redesign (proxy-fronted
+   workspaces) that the threat model does not yet justify. The property the
+   user asked about — key material on a machine that no session container
+   can route to, safe even against session-box host root — is delivered by
+   moving only the proxy and monitoring to the second box. The gateway
+   container's `docker.sock` mount means a gateway compromise is already
+   host-equivalent wherever it runs; that risk is unchanged by the split.
+4. **Monitoring belongs on the trusted box.** A small, static, 3-container
+   machine where any change is signal: auditd, file-integrity (AIDE),
+   central syslog receiving the session box's logs (absence of forwarded
+   logs is itself a signal), unattended-upgrades. The session box cannot be
+   trusted to report its own compromise.
+
 ## What still waits for the operator
 
 1. **Lock session egress**: `deploy/egress-lockdown.sh` — still operator-run,
