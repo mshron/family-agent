@@ -91,14 +91,17 @@ function tokenize(command) {
 
 // Card-field detection over snapshot -i output. Autocomplete hints are the
 // reliable signal; name/id/placeholder words are the fallback.
-const PATTERNS = {
-  number: /(cc-number|cardnumber|card-?number|ccnum)/i,
-  cvc: /(cc-csc|cc-cvc|cvc|cvv|security[ -]?code)/i,
-  exp: /(cc-exp$|card-?exp(?!ir[- ]?(month|year))|expir(?:ation|y)[- ]?(date|field)?$)/i,
-  expMonth: /(cc-exp-?month|expir[- ]?month|exp[- ]?month)/i,
-  expYear: /(cc-exp-?year|expir[- ]?year|exp[- ]?year)/i,
-  name: /(cc-name|card-?name|name[ -]?on[ -]?card)/i,
-};
+// Order matters: the specific month/year patterns must claim a line
+// before the generic expiry one. Each line (one input) maps to at most
+// one field.
+const PATTERNS = [
+  ["expMonth", /(cc[ -]?exp[ -]?month|expir[ -]?month|exp[ -]?month)/i],
+  ["expYear", /(cc[ -]?exp[ -]?year|expir[ -]?year|exp[ -]?year)/i],
+  ["exp", /(cc[ -]?exp|card[ -]?exp|expir)/i],
+  ["number", /(cc[ -]?number|card[ -]?number|cardnumber|ccnum)/i],
+  ["cvc", /(cc[ -]?csc|cc[ -]?cvc|cvc|cvv|security[ -]?code)/i],
+  ["name", /(cc[ -]?name|card[ -]?name|name[ -]?on[ -]?card)/i],
+];
 
 function cardFields(snapshotText) {
   const fields = {};
@@ -108,8 +111,11 @@ function cardFields(snapshotText) {
     if (!m) continue;
     const ref = m[1];
     const low = line.toLowerCase();
-    for (const [field, re] of Object.entries(PATTERNS)) {
-      if (!fields[field] && re.test(low)) fields[field] = ref;
+    for (const [field, re] of PATTERNS) {
+      if (re.test(low)) {
+        if (!fields[field]) fields[field] = ref;
+        break; // one input, one field
+      }
     }
   }
   return fields;
