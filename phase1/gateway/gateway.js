@@ -2215,8 +2215,16 @@ async function migrateDmDocs() {
 async function renameWorkStream(oldName, newName, dmChannel) {
   try {
     const stream = await zulip.getStreamByName(oldName);
-    if (!stream) return false;
-    await zulip.renameStream(stream.stream_id, newName);
+    if (stream) {
+      // The bot is usually not a stream administrator, so this is refused;
+      // the person can rename it in Zulip and the next boot adopts it below.
+      await zulip.renameStream(stream.stream_id, newName);
+    } else {
+      // Old name gone: someone renamed it manually. Adopt it if the new
+      // name exists; otherwise there is nothing to move onto.
+      const target = await zulip.getStreamByName(newName);
+      if (!target) return false;
+    }
   } catch (err) {
     log.warn(`work stream rename ${oldName} -> ${newName} refused: ${err.message}`);
     return false;
