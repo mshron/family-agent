@@ -22,7 +22,7 @@ curl -fsSL "$REPO/archive/$BRANCH.tar.gz" \
 changed=0
 for f in Caddyfile compose.yml gmail-proxy.py squid.conf browser/Dockerfile browser/service.js update-caddyfile.sh; do
   if [ ! -f "$DIR/$f" ] || ! cmp -s "$tmp/phase1/deploy/proxy/$f" "$DIR/$f"; then
-    install -m 644 "$tmp/phase1/deploy/proxy/$f" "$DIR/$f"
+    install -D -m 644 "$tmp/phase1/deploy/proxy/$f" "$DIR/$f"
     echo "updated $f"
     changed=1
   fi
