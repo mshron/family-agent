@@ -103,7 +103,8 @@ const PATTERNS = {
 function cardFields(snapshotText) {
   const fields = {};
   for (const line of String(snapshotText).split("\n")) {
-    const m = line.match(/^(@e\d+)/);
+    // Snapshot lines look like: - textbox "Card number" [ref=e1]
+    const m = line.match(/\[ref=(e\d+)\]/);
     if (!m) continue;
     const ref = m[1];
     const low = line.toLowerCase();
