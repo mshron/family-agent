@@ -276,6 +276,7 @@ Everything Phase 1 skipped arrives here — against a system you already like us
 ### Phase 6 — Retirement
 
 - Destroy the three Fly apps (the nanobot bot has been idle since Phase 3 — use a *new* bot user for the gateway from the start, since two pollers on one Zulip user double-respond).
+  - **Done 12 Nov 2026** — after the gateway shipped on the same "Nanobot" bot user, nanobot kept double-responding to DMs: its broken LLM route (502 via litellm) posted a raw provider error as the bot ~13s after each DM. All three apps (`polynumeral-assistant`, `polynumeral-cred-proxy`, `polynumeral-log`) destroyed via flyctl; the volumes went with them, so the old MEMORY.md curation task is moot.
 - Back up and shut down the old chat and code boxes entirely: a final Mongo backup to the existing Hetzner Object Storage bucket, then LibreChat, codeapi, and the boxes themselves go.
 - Move the log service's history and nanobot's `MEMORY.md` into the new memory repo (a real curation task — read it, keep what is true, discard what is stale).
 - **Verify:** billing shows Fly and the old two boxes gone; backups for logs + all repos exist in Object Storage/git remotes.
