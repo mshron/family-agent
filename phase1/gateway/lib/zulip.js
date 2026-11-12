@@ -44,10 +44,12 @@ export class Zulip {
     return this._call("GET", "users/me");
   }
 
-  /** Look up one stream by name: { stream_id, name } | null when absent. */
+  /** Look up one stream by name from the bot's subscriptions:
+   *  { stream_id, name } | null when absent. (This Zulip server ignores
+   *  the stream filter on GET /streams, so filter client-side.) */
   getStreamByName(streamName) {
-    return this._call("GET", "streams", { stream: [streamName] }).then(
-      (body) => body?.streams?.[0] ?? null
+    return this._call("GET", "streams", {}).then(
+      (body) => (body?.streams ?? []).find((s) => s.name === streamName) ?? null
     );
   }
 
@@ -237,9 +239,12 @@ export class Zulip {
 
   /**
    * Upload a file into the realm's user_uploads area (multipart POST).
-   * Returns the full download URL to embed in a message as
-   * `[filename](url)` — Zulip renders that as a file link any org
-   * member can open. Size is capped by the org's upload limit.
+   * Returns the path-absolute download link (`/user_uploads/...`) to embed
+   * in a message as `[filename](link)` — the same form the compose box
+   * inserts for attachments. That form is what Zulip clients treat as an
+   * in-app file (the desktop app cannot resolve the full-origin URL, which
+   * renders as a relative href and "bonks" on click). Any org member can
+   * open it. Size is capped by the org's upload limit.
    */
   async uploadFile(bytes, filename) {
     const form = new FormData();
@@ -257,7 +262,8 @@ export class Zulip {
       err.status = res.status;
       throw err;
     }
-    return new URL(body.uri, this.site).toString();
+    const uri = String(body.uri ?? "");
+    return uri.startsWith("/") ? uri : `/${uri}`;
   }
 
   /** Fetch an uploaded file (user_uploads) with the bot's credentials. */
