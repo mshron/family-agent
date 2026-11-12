@@ -176,10 +176,15 @@ const rules = new PermissionRules({
   // post-hoc consent: no ask rule gates it (autonomy, 12 Nov review)
   assert.equal(config.toolsFor("dm-1").includes("save_skill"), true);
   assert.equal(config.toolsFor("scratch").includes("delete_skill"), true);
+  assert.equal(config.toolsFor("scratch").includes("memory_search"), true);
   const rules = new PermissionRules(config.permissionConfigFor("dm-1"));
   assert.equal(rules.classifyTool("save_skill").decision, "allow");
   assert.equal(rules.classifyTool("delete_skill").decision, "allow");
-  ok("channel config: dm tool set, dm permission fallback, people entries, skills tools ungated");
+  // Memory writes ungated too (12 Nov review, second pass): recall goes
+  // through memory_search, consent through the reply text.
+  assert.equal(rules.classifyPaths("write", "memory/user.md").decision, "allow");
+  assert.equal(rules.classifyPaths("edit", "memory/x.md").decision, "allow");
+  ok("channel config: dm tool set, dm permission fallback, people entries, skills and memory ungated");
 }
 
 // --- the ask flow ------------------------------------------------------------

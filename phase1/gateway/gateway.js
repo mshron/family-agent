@@ -11,7 +11,7 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { appendFile, mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { Harness } from "@earendil-works/pi-durable";
@@ -330,6 +330,7 @@ const ZulipTools = buildZulipTools({
   onTaskAgent: taskAgentFor,
   onSaveSkill,
   onTaskLedger: appendTaskLedger,
+  onMemorySearch: searchMemory,
   uniqueTopicFor: uniqueTopic,
 });
 
@@ -522,6 +523,7 @@ const INSTRUCTIONS = [
   "history_search finds past conversations in this channel; spawn_thread and fork_thread create new topics.",
   "When you finish a job and learn a better way to do this kind of work, call save_skill with the method, then tell the person",
   "what you kept and ask whether to keep it (delete_skill removes it if not); future task conversations load saved skills.",
+  "memory_search finds remembered detail in memory topic files — use it before asking the user for something they may have told you before.",
 ].join(" ");
 
 const INSTRUCTIONS_DM = [
@@ -534,8 +536,9 @@ const INSTRUCTIONS_DM = [
   "- run_task with wait=false runs the job in the background; its result arrives here when it finishes.",
   "- Every delegated job is recorded in the task ledger (tasks.md in the workspace); the /tasks command and the nightly consolidation read it.",
   "- When the same kind of job repeats, or the person gives durable feedback on how work should be done, call save_skill to keep the method as a skill. Tell the person what you saved and ask whether to keep it; delete_skill removes it if not. Future task conversations load saved skills.",
-  "- Memory lives in memory/ files and loads fresh on every message. When the user says \"remember X\" or \"forget Y\", edit the matching memory file and say what changed. Never put anything in memory the user would not want kept.",
-  "- Some turns are scheduled passes (marked as such): propose memory edits in your reply, and apply them only after the user agrees.",
+  "- Memory lives in memory/ files and loads fresh on every message. Write it directly — memory edits need no approval: say what changed in your reply. Never put anything in memory the user would not want kept.",
+  "- Keep the always-loaded memory files small: memory/user.md and the channel memory file carry core facts and preferences only. Put detail into memory topic files (memory/<topic>.md); memory_search finds them, and the nightly consolidation files detail there.",
+  "- Some turns are scheduled passes (marked as such): consolidate what the recent turns hold into memory directly, keep the loaded files small, and reply with what you changed.",
   "history_search finds past conversations in direct messages; there are no topics here, so spawn_thread and fork_thread do not apply.",
   "Workspace conventions: notes in notes/, writeups in docs/, uploads in uploads/. Commit your changes; say in your reply when you change memory.",
 ].join("\n");
@@ -808,6 +811,51 @@ async function onSaveSkill(conversationId, args) {
   const target = await skillsChannelForDoc(doc);
   if (!target || typeof target === "object") throw new Error(target?.error || "no skills directory for this conversation");
   return saveSkillToStream(target, args);
+}
+
+// Memory recall (dm-first memo, the OpenClaw lore shape): the always-loaded
+// memory stays small; durable detail lives in memory topic files, found by
+// explicit search. Lexical term scoring, not embeddings — at personal-memory
+// scale there is nothing to distinguish, and there are no moving parts.
+
+async function searchMemory(conversationId, query) {
+  const doc = await harness.snapshot(ZulipDoc, conversationId, context).catch(() => null);
+  if (!doc?.stream) throw new Error("no channel mapping for this conversation");
+  const base = path.join(workspaceDir(env, workspaceChannelOf(doc.stream)), "memory");
+  const terms = String(query)
+    .toLowerCase()
+    .split(/[^\w-]+/)
+    .filter((t) => t.length > 1);
+  if (terms.length === 0) return [];
+  const hits = [];
+  const walk = async (dir, rel) => {
+    let entries = [];
+    try {
+      entries = await readdir(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of entries) {
+      if (e.name.startsWith(".")) continue;
+      const p = path.join(dir, e.name);
+      const r = rel ? `${rel}/${e.name}` : e.name;
+      if (e.isDirectory()) await walk(p, r);
+      else if (e.name.endsWith(".md")) {
+        const text = await readFile(p, "utf8").catch(() => "");
+        const lines = text.split("\n");
+        for (let i = 0; i < lines.length; i++) {
+          const low = lines[i].toLowerCase();
+          let score = 0;
+          for (const t of terms) if (low.includes(t)) score += 1;
+          if (score > 0)
+            hits.push({ score, file: `memory/${r}`, line: i + 1, text: lines[i].slice(0, 200) });
+        }
+      }
+    }
+  };
+  await walk(base, "");
+  hits.sort((a, b) => b.score - a.score);
+  return hits.slice(0, 10);
 }
 
 // ---------------------------------------------------------------------------
@@ -2263,17 +2311,17 @@ function pollLoop() {
 
 // ---------------------------------------------------------------------------
 // Scheduled proactivity (dm-first memo): one nightly memory-consolidation
-// pass per person's front conversation. The pass proposes edits in its
-// reply (it does not write memory itself, so no ask fires overnight); a
-// "nothing" answer is not posted. The requestId dedups a restart mid-pass.
+// pass per person's front conversation. Memory writes need no approval, so
+// the pass edits memory directly and replies with what changed; a "nothing"
+// answer is not posted. The requestId dedups a restart mid-pass.
 
 const CONSOLIDATE_HOUR = Number(process.env.CONSOLIDATE_HOUR ?? 5);
 const CONSOLIDATION_PROMPT = [
   "(scheduled nightly pass, not from the user) This is the memory-consolidation pass.",
   "Look over this conversation's recent turns and the workspace for durable facts about the user that are not yet in memory/.",
-  "If there are some, reply with a short list of proposed memory edits (quote the exact lines you would add or change) and ask the user to confirm them.",
-  "Do not edit memory yourself on this pass.",
-  "If there is nothing worth persisting, reply with exactly: (nothing to consolidate)",
+  "When you find some, edit the memory files directly (memory writes need no approval now):",
+  "keep memory/user.md and the channel memory file small — core facts and preferences only — and put detail into memory topic files (memory/<topic>.md) that memory_search can find.",
+  "Reply with a short list of what you changed (file and one line each), or exactly: (nothing to consolidate)",
 ].join(" ");
 const consolidatedOn = new Map(); // dm channel -> date string
 

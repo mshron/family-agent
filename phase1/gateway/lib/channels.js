@@ -22,6 +22,7 @@ export const STANDARD_TOOLS = [
   "save_skill",
   "update_skill",
   "delete_skill",
+  "memory_search",
 ];
 
 export class ChannelConfig {

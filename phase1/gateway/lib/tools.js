@@ -231,6 +231,7 @@ export function buildZulipTools({
   onTaskAgent,
   onSaveSkill,
   onTaskLedger,
+  onMemorySearch,
   uniqueTopicFor,
 }) {
   const err = (text) => ({ content: [{ type: "text", text }] });
@@ -613,6 +614,51 @@ export function buildZulipTools({
     },
   });
 
+  // Memory recall (dm-first memo, the OpenClaw lore shape): the
+  // always-loaded memory stays small; durable detail lives in memory topic
+  // files, found by explicit search. Hermes's lesson: hoped-for recall rarely
+  // fires — the agent goes looking.
+  const memorySearchTool = defineTool({
+    name: "memory_search",
+    description:
+      "Search this person's memory files (memory/) for remembered facts, preferences, and detail not in the loaded memory. Use when a task needs something that may be remembered — before asking the user.",
+    parameters: Type.Object({
+      query: Type.String({ description: "What to look for: key terms, not a sentence" }),
+    }),
+    replay: "safe",
+    async execute(args, api, context) {
+      if (!onMemorySearch) return err("memory_search is not available in this channel.");
+      let hits;
+      try {
+        hits = await onMemorySearch(api.conversationId, args.query);
+      } catch (e) {
+        return err(`memory_search failed: ${e.message}`);
+      }
+      if (!hits || hits.length === 0) {
+        return {
+          content: [
+            { type: "text", text: `Nothing in memory matches "${args.query}". Read memory/user.md if you have not, then ask the user.` },
+          ],
+        };
+      }
+      const lines = hits.map(
+        (h) => `${h.file}:${h.line} — ${h.text}`
+      );
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Memory matches for "${args.query}" (best first):
+
+${lines.join("\n")}
+
+Read the full file (workspace-relative path) for context around a match.`,
+          },
+        ],
+      };
+    },
+  });
+
   return defineExtension({
     name: "zulip",
     tools: [
@@ -627,6 +673,7 @@ export function buildZulipTools({
       saveSkillTool,
       updateSkillTool,
       deleteSkillTool,
+      memorySearchTool,
     ],
   });
 }
